@@ -269,55 +269,36 @@ class DiabeticRetinopathyDataset(Dataset):
     
     def __getitem__(self, idx):
         try:
-            img_path = os.path.join(self.img_dir, self.df.iloc[idx]['image_path'])
-            
-            # Preprocess image using your preprocessor
-            if self.preprocessor:
-                image, quality, info = self.preprocessor.preprocess(img_path, assess_quality=True)
-                
-                if image is None:
-                    # Return black image if loading fails
-                    image = np.zeros((512, 512, 3), dtype=np.float32)
+            row = self.df.iloc[idx]
+            img_path = os.path.join(self.img_dir, row['image_path'])
+
+            # if the file is missing, fall back to a black image instead of raising
+            if not os.path.isfile(img_path):
+                # this is the “dummy‑image” case
+                img = np.zeros((self.preprocessor.target_size[0],
+                                self.preprocessor.target_size[1], 3),
+                               dtype=np.float32)
+                quality_score = 1.0
+                quality_info = {}
             else:
-                # Fallback: simple loading
-                image = cv2.imread(img_path)
-                if image is None:
-                    image = np.zeros((512, 512, 3), dtype=np.uint8)
-                
-                # Convert BGR to RGB
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                
-                # Resize
-                image = cv2.resize(image, (512, 512), interpolation=cv2.INTER_LANCZOS4)
-                
-                # Normalize
-                image = image.astype(np.float32) / 255.0
-            
-            # Convert to uint8 for PIL
-            image_uint8 = (image * 255).astype(np.uint8)
-            image_pil = Image.fromarray(image_uint8)
-            
-            # Apply transforms
-            if self.transform:
-                image_pil = self.transform(image_pil)
-            else:
-                # Default: to tensor + normalize
-                image_pil = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]
-                    )
-                ])(image_pil)
-            
-            label = int(self.df.iloc[idx]['diagnosis'])
-            
-            return image_pil, label
+                img, quality_score, quality_info = self.preprocessor.preprocess(
+                    img_path, assess_quality=Config.QUALITY_CHECK
+                )
+
+            # convert to PIL so the torchvision transforms work
+            pil = Image.fromarray((img * 255).astype(np.uint8))
+
+            if self.transform is not None:
+                pil = self.transform(pil)
+
+            label = int(row['diagnosis'])
+            return pil, label
+
         except Exception as e:
-            print(f"Error loading image at index {idx}: {e}")
-            # Return black image if loading fails
-            default_image = torch.zeros(3, 512, 512)
-            return default_image, 0
+            # if something still goes wrong, return a zero tensor and a dummy label
+            print(f"Error preprocessing {img_path}: {e}")
+            blank = torch.zeros(3, *self.preprocessor.target_size)
+            return blank, 0
 
 
 def get_data_transforms(augment=True):
