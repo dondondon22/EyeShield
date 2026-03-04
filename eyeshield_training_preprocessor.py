@@ -788,7 +788,7 @@ def main():
     
     # Load dataset from CSV
     print("Loading dataset from CSV...")
-    df = pd.read_csv('/content/dataset/labels.csv')
+    df = pd.read_csv('/content/dataset/labels.csv').head(100)
     dataset_root = '/tmp/kagglehub'  # Kaggle hub downloads to this directory
     
     # If using the Kaggle download from the notebook
@@ -860,5 +860,5 @@ def main():
     print(f"\nFinal model saved to {Config.CHECKPOINT_DIR}/final_model.pth")
 
 
-if __name__ == '__main__':
-    main()
+# Call main() directly - this script is meant to be exec'd in notebooks
+main()
