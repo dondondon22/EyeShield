@@ -271,32 +271,29 @@ class DiabeticRetinopathyDataset(Dataset):
         try:
             row = self.df.iloc[idx]
             img_path = os.path.join(self.img_dir, row['image_path'])
-
-            # if the file is missing, fall back to a black image instead of raising
+            
+            # Check if file exists
             if not os.path.isfile(img_path):
-                # this is the “dummy‑image” case
-                img = np.zeros((self.preprocessor.target_size[0],
-                                self.preprocessor.target_size[1], 3),
-                               dtype=np.float32)
-                quality_score = 1.0
-                quality_info = {}
-            else:
-                img, quality_score, quality_info = self.preprocessor.preprocess(
-                    img_path, assess_quality=Config.QUALITY_CHECK
-                )
-
-            # convert to PIL so the torchvision transforms work
+                print(f"Warning: Image not found: {img_path}")
+                # Return blank tensor if file missing
+                blank = torch.zeros(3, *self.preprocessor.target_size)
+                return blank, int(row['diagnosis'])
+            
+            img, quality_score, quality_info = self.preprocessor.preprocess(
+                img_path, assess_quality=Config.QUALITY_CHECK
+            )
+            
+            # Convert to PIL for transforms
             pil = Image.fromarray((img * 255).astype(np.uint8))
-
+            
             if self.transform is not None:
                 pil = self.transform(pil)
-
+            
             label = int(row['diagnosis'])
             return pil, label
-
+        
         except Exception as e:
-            # if something still goes wrong, return a zero tensor and a dummy label
-            print(f"Error preprocessing {img_path}: {e}")
+            print(f"Error loading {img_path}: {e}")
             blank = torch.zeros(3, *self.preprocessor.target_size)
             return blank, 0
 
@@ -789,34 +786,39 @@ def main():
     print(f"  - Target size: {Config.TARGET_IMAGE_SIZE}")
     print(f"  - Quality assessment: {'Enabled' if Config.QUALITY_CHECK else 'Disabled'}\n")
     
-    # Load dataset
-    print("Loading dataset...")
+    # Load dataset from CSV
+    print("Loading dataset from CSV...")
+    df = pd.read_csv('/content/dataset/labels.csv')
+    dataset_root = '/tmp/kagglehub'  # Kaggle hub downloads to this directory
     
-    # Create dummy data for demonstration
-    dummy_df = pd.DataFrame({
-        'image_path': [f'img_{i}.jpg' for i in range(100)],
-        'diagnosis': [np.random.randint(0, 5) for _ in range(100)]
-    })
+    # If using the Kaggle download from the notebook
+    import kagglehub
+    dataset_root = kagglehub.dataset_download("ascanipek/eyepacs-aptos-messidor-diabetic-retinopathy")
+    print(f"✓ Loaded {len(df)} images from dataset")
+    print(f"  - Class distribution:\n{df['diagnosis'].value_counts().sort_index()}\n")
     
     # Split data
-    train_size = int(len(dummy_df) * Config.TRAIN_RATIO)
-    val_size = int(len(dummy_df) * Config.VAL_RATIO)
+    train_size = int(len(df) * Config.TRAIN_RATIO)
+    val_size = int(len(df) * Config.VAL_RATIO)
     
-    train_df = dummy_df[:train_size]
-    val_df = dummy_df[train_size:train_size+val_size]
-    test_df = dummy_df[train_size+val_size:]
+    train_df = df[:train_size].reset_index(drop=True)
+    val_df = df[train_size:train_size+val_size].reset_index(drop=True)
+    test_df = df[train_size+val_size:].reset_index(drop=True)
+    
+    print(f"Data split:")
+    print(f"  - Train: {len(train_df)} images")
+    print(f"  - Val: {len(val_df)} images")
+    print(f"  - Test: {len(test_df)} images\n")
     
     # Data transforms
     train_transform, val_transform = get_data_transforms(augment=Config.AUGMENT)
     
     # Datasets and dataloaders
-    img_dir = './dummy_images'
-    
     train_dataset = DiabeticRetinopathyDataset(
-        train_df, img_dir, transform=train_transform, preprocessor=preprocessor
+        train_df, dataset_root, transform=train_transform, preprocessor=preprocessor
     )
     val_dataset = DiabeticRetinopathyDataset(
-        val_df, img_dir, transform=val_transform, preprocessor=preprocessor
+        val_df, dataset_root, transform=val_transform, preprocessor=preprocessor
     )
     
     train_loader = DataLoader(
