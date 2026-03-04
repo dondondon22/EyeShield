@@ -688,8 +688,7 @@ class Trainer:
             'epoch': epoch,
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
-            'accuracy': accuracy,
-            'config': self.config.__dict__
+            'accuracy': accuracy
         }
         path = os.path.join(
             self.config.CHECKPOINT_DIR,
@@ -704,8 +703,7 @@ class Trainer:
             'epoch': epoch,
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
-            'val_metrics': val_metrics,
-            'config': self.config.__dict__
+            'val_metrics': val_metrics
         }
         path = os.path.join(self.config.CHECKPOINT_DIR, 'best_model.pt')
         torch.save(checkpoint, path)
