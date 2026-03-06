@@ -219,8 +219,8 @@ class Config:
     # Model parameters
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
     INPUT_SIZE = (640, 640)
-    BATCH_SIZE = 32
-    NUM_EPOCHS = 100
+    BATCH_SIZE = 256
+    NUM_EPOCHS = 50
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
     
@@ -630,7 +630,7 @@ class Trainer:
         """Full training loop"""
         best_val_acc = 0
         patience_counter = 0
-        patience = 10
+        patience = 15
         
         print("\n" + "="*80)
         print("Starting Training: EfficientNet-B3 + EDL for DR Classification")
