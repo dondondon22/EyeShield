@@ -219,7 +219,7 @@ class Config:
     # Model parameters
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
     INPUT_SIZE = (640, 640)
-    BATCH_SIZE = 80
+    BATCH_SIZE = 64
     NUM_EPOCHS = 150
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
