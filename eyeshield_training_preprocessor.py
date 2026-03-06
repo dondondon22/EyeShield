@@ -851,11 +851,21 @@ def main():
     best_model_path = os.path.join(Config.CHECKPOINT_DIR, 'best_model.pt')
     if os.path.exists(best_model_path):
         print(f"Loading best model from checkpoint...")
-        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+        try:
+            # Allowlist numpy scalar for safe loading
+            torch.serialization.add_safe_globals([np._core.multiarray.scalar])
+            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+        except:
+            # Fallback: just load without weights_only restriction
+            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+        
         model.load_state_dict(checkpoint['model_state'])
         start_epoch = checkpoint['epoch'] + 1
         print(f"✓ Resumed from epoch {start_epoch}")
-        print(f"  Previous best validation metrics: {checkpoint['val_metrics']}\n")
+        if 'val_metrics' in checkpoint:
+            print(f"  Previous best validation metrics: Accuracy={checkpoint['val_metrics'].get('accuracy', 'N/A'):.4f}\n")
+        else:
+            print()
     else:
         print("No checkpoint found. Starting fresh training.\n")
     
