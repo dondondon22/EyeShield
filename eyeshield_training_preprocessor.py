@@ -219,7 +219,7 @@ class Config:
     # Model parameters
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
     INPUT_SIZE = (512, 512)
-    BATCH_SIZE = 16
+    BATCH_SIZE = 32
     NUM_EPOCHS = 50
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
@@ -786,7 +786,7 @@ def main():
     
     # Load dataset from CSV
     print("Loading dataset from CSV...")
-    df = pd.read_csv('/content/dataset/labels.csv').head(100)
+    df = pd.read_csv('/content/dataset/labels.csv')
     dataset_root = '/tmp/kagglehub'  # Kaggle hub downloads to this directory
     
     # If using the Kaggle download from the notebook
