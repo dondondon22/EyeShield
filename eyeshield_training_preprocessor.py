@@ -220,7 +220,7 @@ class Config:
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
     INPUT_SIZE = (512, 512)
     BATCH_SIZE = 32
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 100
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
     
