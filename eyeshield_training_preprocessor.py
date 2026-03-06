@@ -209,7 +209,7 @@ class Config:
     """Configuration for training"""
     
     # Image Preprocessing
-    TARGET_IMAGE_SIZE = (512, 512)  # Your preferred size for training
+    TARGET_IMAGE_SIZE = (640, 640)  # Your preferred size for training
     QUALITY_CHECK = True            # Assess image quality
     
     # Dataset paths
@@ -218,9 +218,9 @@ class Config:
     
     # Model parameters
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
-    INPUT_SIZE = (512, 512)
-    BATCH_SIZE = 96
-    NUM_EPOCHS = 100
+    INPUT_SIZE = (640, 640)
+    BATCH_SIZE = 80
+    NUM_EPOCHS = 150
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
     
