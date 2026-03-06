@@ -209,7 +209,7 @@ class Config:
     """Configuration for training"""
     
     # Image Preprocessing
-    TARGET_IMAGE_SIZE = (640, 640)  # Your preferred size for training
+    TARGET_IMAGE_SIZE = (512, 512)  # Your preferred size for training
     QUALITY_CHECK = True            # Assess image quality
     
     # Dataset paths
@@ -218,8 +218,8 @@ class Config:
     
     # Model parameters
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
-    INPUT_SIZE = (640, 640)
-    BATCH_SIZE = 96
+    INPUT_SIZE = (512, 512)
+    BATCH_SIZE = 32
     NUM_EPOCHS = 100
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
@@ -630,7 +630,7 @@ class Trainer:
         """Full training loop"""
         best_val_acc = 0
         patience_counter = 0
-        patience = 15
+        patience = 10
         
         print("\n" + "="*80)
         print("Starting Training: EfficientNet-B3 + EDL for DR Classification")
