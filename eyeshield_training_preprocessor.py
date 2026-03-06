@@ -852,20 +852,29 @@ def main():
     if os.path.exists(best_model_path):
         print(f"Loading best model from checkpoint...")
         try:
-            # Allowlist numpy scalar for safe loading
-            torch.serialization.add_safe_globals([np._core.multiarray.scalar])
-            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-        except:
-            # Fallback: just load without weights_only restriction
-            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+            # Try loading with pickle first to handle numpy objects
+            import pickle
+            with open(best_model_path, 'rb') as f:
+                checkpoint = pickle.load(f)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load checkpoint ({str(e)[:50]}...)")
+            print(f"Starting fresh training from epoch 0.\n")
+            start_epoch = 0
+            checkpoint = None
         
-        model.load_state_dict(checkpoint['model_state'])
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"✓ Resumed from epoch {start_epoch}")
-        if 'val_metrics' in checkpoint:
-            print(f"  Previous best validation metrics: Accuracy={checkpoint['val_metrics'].get('accuracy', 'N/A'):.4f}\n")
-        else:
-            print()
+        if checkpoint is not None:
+            try:
+                model.load_state_dict(checkpoint['model_state'])
+                start_epoch = checkpoint.get('epoch', 0) + 1
+                print(f"✓ Resumed from epoch {start_epoch}")
+                if 'val_metrics' in checkpoint and isinstance(checkpoint['val_metrics'], dict):
+                    acc = checkpoint['val_metrics'].get('accuracy', 'N/A')
+                    if isinstance(acc, (int, float)):
+                        print(f"  Previous best accuracy: {acc:.4f}\n")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not load model state ({str(e)[:50]}...)")
+                print(f"Starting fresh training from epoch 0.\n")
+                start_epoch = 0
     else:
         print("No checkpoint found. Starting fresh training.\n")
     
