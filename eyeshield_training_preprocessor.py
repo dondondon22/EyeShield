@@ -626,7 +626,7 @@ class Trainer:
             'confusion_matrix': val_metrics['confusion_matrix']
         }
     
-    def train(self, start_epoch=0):
+    def train(self):
         """Full training loop"""
         best_val_acc = 0
         patience_counter = 0
@@ -637,7 +637,7 @@ class Trainer:
         print("Using Your Image Preprocessor")
         print("="*80 + "\n")
         
-        for epoch in range(start_epoch, self.config.NUM_EPOCHS):
+        for epoch in range(self.config.NUM_EPOCHS):
             # Train
             train_metrics = self.train_epoch(epoch)
             
@@ -846,41 +846,9 @@ def main():
     print(f"Total Parameters: {total_params:,}")
     print(f"Trainable Parameters: {trainable_params:,}\n")
     
-    # RESUME FROM CHECKPOINT - ADD HERE
-    start_epoch = 0
-    best_model_path = os.path.join(Config.CHECKPOINT_DIR, 'best_model.pt')
-    if os.path.exists(best_model_path):
-        print(f"Loading best model from checkpoint...")
-        try:
-            # Try loading with pickle first to handle numpy objects
-            import pickle
-            with open(best_model_path, 'rb') as f:
-                checkpoint = pickle.load(f)
-        except Exception as e:
-            print(f"⚠️  Warning: Could not load checkpoint ({str(e)[:50]}...)")
-            print(f"Starting fresh training from epoch 0.\n")
-            start_epoch = 0
-            checkpoint = None
-        
-        if checkpoint is not None:
-            try:
-                model.load_state_dict(checkpoint['model_state'])
-                start_epoch = checkpoint.get('epoch', 0) + 1
-                print(f"✓ Resumed from epoch {start_epoch}")
-                if 'val_metrics' in checkpoint and isinstance(checkpoint['val_metrics'], dict):
-                    acc = checkpoint['val_metrics'].get('accuracy', 'N/A')
-                    if isinstance(acc, (int, float)):
-                        print(f"  Previous best accuracy: {acc:.4f}\n")
-            except Exception as e:
-                print(f"⚠️  Warning: Could not load model state ({str(e)[:50]}...)")
-                print(f"Starting fresh training from epoch 0.\n")
-                start_epoch = 0
-    else:
-        print("No checkpoint found. Starting fresh training.\n")
-    
     # Train
     trainer = Trainer(model, train_loader, val_loader, Config)
-    trainer.train(start_epoch=start_epoch)
+    trainer.train()
     
     # Plot results
     trainer.plot_training_history()
