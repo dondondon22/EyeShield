@@ -626,7 +626,7 @@ class Trainer:
             'confusion_matrix': val_metrics['confusion_matrix']
         }
     
-    def train(self):
+    def train(self, start_epoch=0):
         """Full training loop"""
         best_val_acc = 0
         patience_counter = 0
@@ -637,7 +637,7 @@ class Trainer:
         print("Using Your Image Preprocessor")
         print("="*80 + "\n")
         
-        for epoch in range(self.config.NUM_EPOCHS):
+        for epoch in range(start_epoch, self.config.NUM_EPOCHS):
             # Train
             train_metrics = self.train_epoch(epoch)
             
@@ -846,9 +846,22 @@ def main():
     print(f"Total Parameters: {total_params:,}")
     print(f"Trainable Parameters: {trainable_params:,}\n")
     
+    # RESUME FROM CHECKPOINT - ADD HERE
+    start_epoch = 0
+    best_model_path = os.path.join(Config.CHECKPOINT_DIR, 'best_model.pt')
+    if os.path.exists(best_model_path):
+        print(f"Loading best model from checkpoint...")
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"✓ Resumed from epoch {start_epoch}")
+        print(f"  Previous best validation metrics: {checkpoint['val_metrics']}\n")
+    else:
+        print("No checkpoint found. Starting fresh training.\n")
+    
     # Train
     trainer = Trainer(model, train_loader, val_loader, Config)
-    trainer.train()
+    trainer.train(start_epoch=start_epoch)
     
     # Plot results
     trainer.plot_training_history()
