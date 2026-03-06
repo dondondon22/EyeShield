@@ -851,7 +851,7 @@ def main():
     best_model_path = os.path.join(Config.CHECKPOINT_DIR, 'best_model.pt')
     if os.path.exists(best_model_path):
         print(f"Loading best model from checkpoint...")
-        checkpoint = torch.load(best_model_path, map_location=device)
+        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state'])
         start_epoch = checkpoint['epoch'] + 1
         print(f"✓ Resumed from epoch {start_epoch}")
