@@ -221,8 +221,8 @@ class Config:
     INPUT_SIZE = (512, 512)
     BATCH_SIZE = 32
     NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-5
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
     
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
@@ -630,7 +630,7 @@ class Trainer:
         """Full training loop"""
         best_val_acc = 0
         patience_counter = 0
-        patience = 10
+        patience = 15
         
         print("\n" + "="*80)
         print("Starting Training: EfficientNet-B3 + EDL for DR Classification")
