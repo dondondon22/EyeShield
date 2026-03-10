@@ -33,6 +33,7 @@ from sklearn.preprocessing import StandardScaler
 import cv2
 from PIL import Image
 import pydicom
+from torch.utils.data import WeightedRandomSampler
 
 # GPU/Device Setup
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -403,16 +404,71 @@ class EfficientNetB3EDL(nn.Module):
 
 
 # ==================== LOSS FUNCTIONS ====================
-class EvidentialLoss(nn.Module):
-    """Type-II Maximum Likelihood EDL Loss"""
+def calculate_class_weights(labels, num_classes):
+    """
+    Calculate class weights to handle imbalanced data.
     
-    def __init__(self, num_classes, kl_weight=0.1):
+    Args:
+        labels: Array of class labels
+        num_classes: Number of classes
+    
+    Returns:
+        torch.Tensor: Class weights tensor
+    """
+    class_counts = np.bincount(labels, minlength=num_classes)
+    total_samples = len(labels)
+    
+    # Weight = total_samples / (num_classes * class_count)
+    # This is the effective number of samples method
+    class_weights = total_samples / (num_classes * (class_counts + 1e-6))
+    class_weights = class_weights / class_weights.sum() * num_classes  # Normalize
+    
+    return torch.tensor(class_weights, dtype=torch.float32)
+
+
+def get_weighted_sampler(df, num_classes):
+    """
+    Create a WeightedRandomSampler for imbalanced classification.
+    
+    Args:
+        df: DataFrame with 'diagnosis' column
+        num_classes: Number of classes
+    
+    Returns:
+        WeightedRandomSampler: Sampler that balances classes
+    """
+    # Get class weights
+    class_weights = calculate_class_weights(df['diagnosis'].values, num_classes)
+    
+    # Assign weight to each sample based on its class
+    sample_weights = class_weights[df['diagnosis'].values].numpy()
+    
+    # Create sampler
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(df),
+        replacement=True
+    )
+    
+    return sampler, class_weights
+
+
+class EvidentialLoss(nn.Module):
+    """Type-II Maximum Likelihood EDL Loss with Class Weights"""
+    
+    def __init__(self, num_classes, kl_weight=0.1, class_weights=None):
         super(EvidentialLoss, self).__init__()
         self.num_classes = num_classes
         self.kl_weight = kl_weight
+        
+        # Register class weights as buffer (will be moved to device with model)
+        if class_weights is not None:
+            self.register_buffer('class_weights', class_weights)
+        else:
+            self.class_weights = torch.ones(num_classes)
     
     def forward(self, evidence, targets, epoch, annealing_step):
-        """Compute EDL loss with annealing KL regularization"""
+        """Compute EDL loss with annealing KL regularization and class weights"""
         
         # Convert targets to one-hot if needed
         if targets.dim() == 1:
@@ -430,6 +486,10 @@ class EvidentialLoss(nn.Module):
         nll_loss = torch.sum((targets_one_hot - belief) ** 2, dim=1, keepdim=True)
         nll_loss += torch.sum(alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True)
         
+        # Apply class weights
+        class_weight_targets = self.class_weights[targets].unsqueeze(1)
+        nll_loss = nll_loss * class_weight_targets
+        
         # KL regularization with annealing
         lam = min(1.0, epoch / annealing_step) if epoch < annealing_step else 1.0
         
@@ -440,6 +500,9 @@ class EvidentialLoss(nn.Module):
             torch.sum(kl_alpha * (torch.digamma(alpha) - torch.digamma(S)), dim=1, keepdim=True),
             dim=1, keepdim=True
         )
+        
+        # Apply class weights to KL loss as well
+        kl_loss = kl_loss * class_weight_targets
         
         total_loss = torch.mean(nll_loss) + self.kl_weight * torch.mean(kl_loss)
         
@@ -499,7 +562,7 @@ class EDLMetrics:
 class Trainer:
     """Training loop for EDL model"""
     
-    def __init__(self, model, train_loader, val_loader, config):
+    def __init__(self, model, train_loader, val_loader, config, class_weights=None):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -507,7 +570,11 @@ class Trainer:
         self.device = device
         
         # Loss and optimizer
-        self.criterion = EvidentialLoss(config.NUM_CLASSES, kl_weight=config.KL_WEIGHT)
+        self.criterion = EvidentialLoss(
+            config.NUM_CLASSES, 
+            kl_weight=config.KL_WEIGHT,
+            class_weights=class_weights
+        )
         self.optimizer = optim.AdamW(
             model.parameters(),
             lr=config.LEARNING_RATE,
@@ -757,6 +824,106 @@ class Trainer:
 
 
 # ==================== MAIN ====================
+def visualize_class_distribution(train_df, val_df, test_df, class_weights, log_dir):
+    """
+    Visualize class distribution before and after balancing.
+    
+    Args:
+        train_df: Training dataframe
+        val_df: Validation dataframe
+        test_df: Test dataframe
+        class_weights: Calculated class weights
+        log_dir: Directory to save visualizations
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    
+    class_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle('Class Distribution Analysis', fontsize=16, fontweight='bold')
+    
+    # 1. Training set class distribution
+    train_counts = train_df['diagnosis'].value_counts().sort_index()
+    axes[0, 0].bar(range(len(train_counts)), train_counts.values, color='steelblue')
+    axes[0, 0].set_xticks(range(len(train_counts)))
+    axes[0, 0].set_xticklabels([class_names[i] for i in train_counts.index])
+    axes[0, 0].set_ylabel('Count')
+    axes[0, 0].set_title('Original Training Set Distribution')
+    axes[0, 0].grid(axis='y', alpha=0.3)
+    for i, v in enumerate(train_counts.values):
+        axes[0, 0].text(i, v + 10, str(v), ha='center', va='bottom', fontweight='bold')
+    
+    # 2. Validation set class distribution
+    val_counts = val_df['diagnosis'].value_counts().sort_index()
+    axes[0, 1].bar(range(len(val_counts)), val_counts.values, color='darkorange')
+    axes[0, 1].set_xticks(range(len(val_counts)))
+    axes[0, 1].set_xticklabels([class_names[i] for i in val_counts.index])
+    axes[0, 1].set_ylabel('Count')
+    axes[0, 1].set_title('Validation Set Distribution')
+    axes[0, 1].grid(axis='y', alpha=0.3)
+    for i, v in enumerate(val_counts.values):
+        axes[0, 1].text(i, v + 10, str(v), ha='center', va='bottom', fontweight='bold')
+    
+    # 3. Class weights used for balancing
+    axes[1, 0].bar(range(len(class_weights)), class_weights.numpy(), color='darkgreen')
+    axes[1, 0].set_xticks(range(len(class_weights)))
+    axes[1, 0].set_xticklabels(class_names)
+    axes[1, 0].set_ylabel('Weight')
+    axes[1, 0].set_title('Class Weights for Balancing')
+    axes[1, 0].grid(axis='y', alpha=0.3)
+    for i, v in enumerate(class_weights.numpy()):
+        axes[1, 0].text(i, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    # 4. Imbalance ratio (percentage)
+    total_train = len(train_df)
+    percentages = [(train_counts.get(i, 0) / total_train * 100) for i in range(len(class_names))]
+    axes[1, 1].bar(range(len(percentages)), percentages, color='crimson')
+    axes[1, 1].set_xticks(range(len(percentages)))
+    axes[1, 1].set_xticklabels(class_names)
+    axes[1, 1].set_ylabel('Percentage (%)')
+    axes[1, 1].set_title('Class Distribution (% of Training Set)')
+    axes[1, 1].grid(axis='y', alpha=0.3)
+    for i, v in enumerate(percentages):
+        axes[1, 1].text(i, v + 1, f'{v:.1f}%', ha='center', va='bottom', fontweight='bold')
+    
+    plt.tight_layout()
+    save_path = os.path.join(log_dir, 'class_distribution.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Class distribution visualization saved to {save_path}")
+    plt.show()
+    
+    # Print detailed statistics
+    print("\n" + "="*80)
+    print("CLASS DISTRIBUTION STATISTICS")
+    print("="*80)
+    print(f"\nTraining Set ({len(train_df)} total):")
+    for i, count in enumerate(train_counts):
+        pct = (count / len(train_df) * 100)
+        weight = class_weights[i].item()
+        print(f"  {class_names[i]:15s}: {count:5d} samples ({pct:5.1f}%) | Weight: {weight:.4f}")
+    
+    print(f"\nValidation Set ({len(val_df)} total):")
+    for i in range(len(class_names)):
+        count = val_counts.get(i, 0)
+        pct = (count / len(val_df) * 100)
+        print(f"  {class_names[i]:15s}: {count:5d} samples ({pct:5.1f}%)")
+    
+    print(f"\nTest Set ({len(test_df)} total):")
+    test_counts = test_df['diagnosis'].value_counts().sort_index()
+    for i in range(len(class_names)):
+        count = test_counts.get(i, 0)
+        pct = (count / len(test_df) * 100) if len(test_df) > 0 else 0
+        print(f"  {class_names[i]:15s}: {count:5d} samples ({pct:5.1f}%)")
+    
+    # Calculate imbalance ratio
+    max_count = train_counts.max()
+    min_count = train_counts.min()
+    imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
+    print(f"\nImbalance Ratio (max/min): {imbalance_ratio:.2f}")
+    print("="*80 + "\n")
+
+
 def main():
     """Main training function"""
     
@@ -813,6 +980,18 @@ def main():
     # Data transforms
     train_transform, val_transform = get_data_transforms(augment=Config.AUGMENT)
     
+    # Calculate class weights for imbalanced data
+    print("Calculating class weights for imbalanced data...")
+    class_sampler, class_weights = get_weighted_sampler(train_df, Config.NUM_CLASSES)
+    print("✓ Class weights calculated:")
+    for i, weight in enumerate(class_weights):
+        class_name = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative'][i]
+        print(f"  - Class {i} ({class_name}): {weight:.4f}")
+    print()
+    
+    # Visualize class distribution
+    visualize_class_distribution(train_df, val_df, test_df, class_weights, Config.LOG_DIR)
+    
     # Datasets and dataloaders
     train_dataset = DiabeticRetinopathyDataset(
         train_df, dataset_root, transform=train_transform, preprocessor=preprocessor
@@ -821,10 +1000,11 @@ def main():
         val_df, dataset_root, transform=val_transform, preprocessor=preprocessor
     )
     
+    # Use WeightedRandomSampler for training to handle class imbalance
     train_loader = DataLoader(
         train_dataset,
         batch_size=Config.BATCH_SIZE,
-        shuffle=True,
+        sampler=class_sampler,  # Use weighted sampler for balanced batches
         num_workers=Config.NUM_WORKERS,
         pin_memory=True
     )
@@ -849,7 +1029,7 @@ def main():
     print(f"Trainable Parameters: {trainable_params:,}\n")
     
     # Train
-    trainer = Trainer(model, train_loader, val_loader, Config)
+    trainer = Trainer(model, train_loader, val_loader, Config, class_weights=class_weights)
     trainer.train()
     
     # Plot results
