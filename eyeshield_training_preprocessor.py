@@ -222,7 +222,7 @@ class Config:
     INPUT_SIZE = (512, 512)
     BATCH_SIZE = 32
     NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-4
     
     # EDL parameters
@@ -580,9 +580,13 @@ class Trainer:
             lr=config.LEARNING_RATE,
             weight_decay=config.WEIGHT_DECAY
         )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            T_max=config.NUM_EPOCHS
+            mode='min',
+            factor=0.5,
+            patience=5,
+            verbose=True,
+            min_lr=1e-7
         )
         
         # Mixed precision training
@@ -725,7 +729,7 @@ class Trainer:
             self.history['val_ece'].append(val_metrics['ece'])
             
             # Update scheduler
-            self.scheduler.step()
+            self.scheduler.step(val_metrics['loss'])
             
             # Logging
             print(f"\nEpoch {epoch+1}/{self.config.NUM_EPOCHS}")
