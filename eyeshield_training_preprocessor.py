@@ -28,8 +28,9 @@ import torchmetrics
 from torch.cuda.amp import autocast, GradScaler
 
 # For data handling
-from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 import cv2
 from PIL import Image
 import pydicom
@@ -236,6 +237,9 @@ class Config:
     VAL_RATIO = 0.15
     TEST_RATIO = 0.15
     
+    # Early stopping (patience for validation loss non-improvement)
+    EARLY_STOPPING_PATIENCE = 15
+    
     # Checkpoint and logging
     CHECKPOINT_DIR = './checkpoints'
     LOG_DIR = './logs'
@@ -273,16 +277,18 @@ class DiabeticRetinopathyDataset(Dataset):
             row = self.df.iloc[idx]
             img_path = os.path.join(self.img_dir, row['image_path'])
             
-            # Check if file exists
+            # Check if file exists - fail explicitly instead of silently using blank tensor
             if not os.path.isfile(img_path):
-                print(f"Warning: Image not found: {img_path}")
-                # Return blank tensor if file missing
-                blank = torch.zeros(3, *self.preprocessor.target_size)
-                return blank, int(row['diagnosis'])
+                raise FileNotFoundError(f"Image not found at: {img_path}\n"
+                                       f"  Expected path: {img_path}\n"
+                                       f"  Please verify dataset paths in CSV are correct relative to dataset root.")
             
             img, quality_score, quality_info = self.preprocessor.preprocess(
                 img_path, assess_quality=Config.QUALITY_CHECK
             )
+            
+            if img is None:
+                raise ValueError(f"Failed to preprocess image: {img_path}")
             
             # Convert to PIL for transforms
             pil = Image.fromarray((img * 255).astype(np.uint8))
@@ -294,9 +300,8 @@ class DiabeticRetinopathyDataset(Dataset):
             return pil, label
         
         except Exception as e:
-            print(f"Error loading {img_path}: {e}")
-            blank = torch.zeros(3, *self.preprocessor.target_size)
-            return blank, 0
+            print(f"❌ Error loading batch item {idx}: {e}")
+            raise  # Re-raise to fail training explicitly
 
 
 def get_data_transforms(augment=True):
@@ -345,12 +350,15 @@ class EvidentialHead(nn.Module):
         
         # Evidence layer with ReLU activation and batch normalization
         self.evidence_layer = nn.Sequential(
-            nn.Linear(input_features, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(input_features, 512),      # Expanded
+            nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_classes),
-            nn.BatchNorm1d(num_classes)
+            nn.Linear(512, 128),                 # New intermediate
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes)          # No BatchNorm here!
         )
     
     def forward(self, x):
@@ -414,9 +422,18 @@ def calculate_class_weights(labels, num_classes):
     
     Returns:
         torch.Tensor: Class weights tensor
+    
+    Raises:
+        ValueError: If any class has 0 samples
     """
     class_counts = np.bincount(labels, minlength=num_classes)
     total_samples = len(labels)
+    
+    # Check for missing classes
+    empty_classes = np.where(class_counts == 0)[0]
+    if len(empty_classes) > 0:
+        raise ValueError(f"Classes {list(empty_classes)} have 0 samples in training set. "
+                        f"This will cause training failures. Use stratified splitting to ensure all classes are present.")
     
     # Weight = total_samples / (num_classes * class_count)
     # This is the effective number of samples method
@@ -527,8 +544,9 @@ class EDLMetrics:
         """Update metrics with batch results"""
         self.predictions.extend(output['pred'].cpu().numpy())
         self.targets.extend(targets.cpu().numpy())
-        self.uncertainties.extend(output['uncertainty'].squeeze().cpu().detach().numpy())
-        self.confidences.extend(output['confidence'].squeeze().cpu().detach().numpy())
+        # Use view(-1) instead of squeeze to avoid shape issues with batch_size=1
+        self.uncertainties.extend(output['uncertainty'].view(-1).cpu().detach().numpy())
+        self.confidences.extend(output['confidence'].view(-1).cpu().detach().numpy())
     
     def compute(self):
         """Compute all metrics"""
@@ -538,6 +556,12 @@ class EDLMetrics:
         confidences = np.array(self.confidences)
         
         accuracy = accuracy_score(targets, preds)
+        
+        # Macro F1 Score (recommended for imbalanced classification)
+        macro_f1 = f1_score(targets, preds, average='macro', zero_division=0)
+        
+        # Weighted F1 Score
+        weighted_f1 = f1_score(targets, preds, average='weighted', zero_division=0)
         
         # Calibration error (Expected Calibration Error)
         conf_bins = np.linspace(0, 1, 11)
@@ -551,6 +575,8 @@ class EDLMetrics:
         
         return {
             'accuracy': accuracy,
+            'macro_f1': macro_f1,
+            'weighted_f1': weighted_f1,
             'ece': ece,
             'mean_uncertainty': np.mean(uncertainties),
             'mean_confidence': np.mean(confidences),
@@ -597,8 +623,8 @@ class Trainer:
         
         # History
         self.history = {
-            'train_loss': [], 'train_nll': [], 'train_kl': [], 'train_acc': [],
-            'val_loss': [], 'val_nll': [], 'val_kl': [], 'val_acc': [], 'val_ece': []
+            'train_loss': [], 'train_nll': [], 'train_kl': [], 'train_acc': [], 'train_macro_f1': [],
+            'val_loss': [], 'val_nll': [], 'val_kl': [], 'val_acc': [], 'val_macro_f1': [], 'val_ece': []
         }
         
         # Create checkpoint directory
@@ -657,10 +683,11 @@ class Trainer:
             'loss': total_loss / len(self.train_loader),
             'nll': total_nll / len(self.train_loader),
             'kl': total_kl / len(self.train_loader),
-            'accuracy': train_metrics['accuracy']
+            'accuracy': train_metrics['accuracy'],
+            'macro_f1': train_metrics['macro_f1']
         }
     
-    def validate(self):
+    def validate(self, epoch):
         """Validation loop"""
         self.model.eval()
         self.metrics.reset()
@@ -677,7 +704,7 @@ class Trainer:
                 
                 evidence = self.model(images)
                 loss, nll_loss, kl_loss = self.criterion(
-                    evidence, targets, self.config.NUM_EPOCHS, 
+                    evidence, targets, epoch, 
                     self.config.ANNEALING_START
                 )
                 
@@ -695,15 +722,16 @@ class Trainer:
             'nll': total_nll / len(self.val_loader),
             'kl': total_kl / len(self.val_loader),
             'accuracy': val_metrics['accuracy'],
+            'macro_f1': val_metrics['macro_f1'],
             'ece': val_metrics['ece'],
             'confusion_matrix': val_metrics['confusion_matrix']
         }
     
     def train(self):
         """Full training loop"""
-        best_val_acc = 0
+        best_val_loss = float('inf')
         patience_counter = 0
-        patience = 15
+        patience = self.config.EARLY_STOPPING_PATIENCE  # Now configurable from Config
         
         print("\n" + "="*80)
         print("Starting Training: EfficientNet-B3 + EDL for DR Classification")
@@ -715,57 +743,59 @@ class Trainer:
             train_metrics = self.train_epoch(epoch)
             
             # Validate
-            val_metrics = self.validate()
+            val_metrics = self.validate(epoch)
             
             # Update history
             self.history['train_loss'].append(train_metrics['loss'])
             self.history['train_nll'].append(train_metrics['nll'])
             self.history['train_kl'].append(train_metrics['kl'])
             self.history['train_acc'].append(train_metrics['accuracy'])
+            self.history['train_macro_f1'].append(train_metrics['macro_f1'])
             self.history['val_loss'].append(val_metrics['loss'])
             self.history['val_nll'].append(val_metrics['nll'])
             self.history['val_kl'].append(val_metrics['kl'])
             self.history['val_acc'].append(val_metrics['accuracy'])
+            self.history['val_macro_f1'].append(val_metrics['macro_f1'])
             self.history['val_ece'].append(val_metrics['ece'])
             
-            # Update scheduler
+            # Update scheduler based on validation loss
             self.scheduler.step(val_metrics['loss'])
             
             # Logging
             print(f"\nEpoch {epoch+1}/{self.config.NUM_EPOCHS}")
-            print(f"Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.4f}")
-            print(f"Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | ECE: {val_metrics['ece']:.4f}")
+            print(f"Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.4f} | Train Macro F1: {train_metrics['macro_f1']:.4f}")
+            print(f"Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | Val Macro F1: {val_metrics['macro_f1']:.4f} | ECE: {val_metrics['ece']:.4f}")
             
             # Save checkpoint
             if (epoch + 1) % self.config.SAVE_INTERVAL == 0:
-                self.save_checkpoint(epoch, val_metrics['accuracy'])
+                self.save_checkpoint(epoch, val_metrics['macro_f1'])
             
-            # Early stopping
-            if val_metrics['accuracy'] > best_val_acc:
-                best_val_acc = val_metrics['accuracy']
+            # Early stopping based on validation loss (more stable than accuracy for imbalanced data)
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
                 patience_counter = 0
                 self.save_best_model(epoch, val_metrics)
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print(f"\nEarly stopping at epoch {epoch+1}")
+                    print(f"\nEarly stopping at epoch {epoch+1} (validation loss did not improve)")
                     break
         
         print("\n" + "="*80)
         print("Training Complete!")
         print("="*80)
     
-    def save_checkpoint(self, epoch, accuracy):
+    def save_checkpoint(self, epoch, metric_value):
         """Save model checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
-            'accuracy': accuracy
+            'metric': metric_value
         }
         path = os.path.join(
             self.config.CHECKPOINT_DIR,
-            f'checkpoint_epoch_{epoch+1}_acc_{accuracy:.4f}.pt'
+            f'checkpoint_epoch_{epoch+1}_f1_{metric_value:.4f}.pt'
         )
         torch.save(checkpoint, path)
         print(f"Checkpoint saved: {path}")
@@ -784,7 +814,7 @@ class Trainer:
     
     def plot_training_history(self):
         """Plot training history"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
         
         # Loss
         axes[0, 0].plot(self.history['train_loss'], label='Train')
@@ -813,13 +843,31 @@ class Trainer:
         axes[1, 0].legend()
         axes[1, 0].grid(True)
         
-        # ECE (Calibration)
-        axes[1, 1].plot(self.history['val_ece'], label='Calibration Error')
-        axes[1, 1].set_title('Expected Calibration Error')
+        # Macro F1 Score (recommended for imbalanced data)
+        axes[1, 1].plot(self.history['train_macro_f1'], label='Train')
+        axes[1, 1].plot(self.history['val_macro_f1'], label='Val')
+        axes[1, 1].set_title('Macro F1 Score (Primary Metric for Imbalanced Data)')
         axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('ECE')
+        axes[1, 1].set_ylabel('Macro F1')
         axes[1, 1].legend()
         axes[1, 1].grid(True)
+        
+        # KL Loss
+        axes[2, 0].plot(self.history['train_kl'], label='Train KL')
+        axes[2, 0].plot(self.history['val_kl'], label='Val KL')
+        axes[2, 0].set_title('KL Regularization Loss')
+        axes[2, 0].set_xlabel('Epoch')
+        axes[2, 0].set_ylabel('KL Loss')
+        axes[2, 0].legend()
+        axes[2, 0].grid(True)
+        
+        # ECE (Calibration)
+        axes[2, 1].plot(self.history['val_ece'], label='Calibration Error')
+        axes[2, 1].set_title('Expected Calibration Error')
+        axes[2, 1].set_xlabel('Epoch')
+        axes[2, 1].set_ylabel('ECE')
+        axes[2, 1].legend()
+        axes[2, 1].grid(True)
         
         plt.tight_layout()
         plt.savefig(os.path.join(self.config.LOG_DIR, 'training_history.png'), dpi=300)
@@ -959,8 +1007,17 @@ def main():
     
     # Load dataset from CSV
     print("Loading dataset from CSV...")
-    df = pd.read_csv('/content/dataset/labels.csv')
-    dataset_root = '/tmp/kagglehub'  # Kaggle hub downloads to this directory
+    csv_path = '/content/dataset/labels.csv'
+    
+    # Validate CSV exists
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Dataset CSV not found at: {csv_path}\n"
+                               f"Please ensure the 'Prepare Dataset CSV' cell has been executed first.")
+    
+    df = pd.read_csv(csv_path)
+    
+    if len(df) == 0:
+        raise ValueError(f"Dataset CSV is empty at: {csv_path}")
     
     # If using the Kaggle download from the notebook
     import kagglehub
@@ -968,18 +1025,47 @@ def main():
     print(f"✓ Loaded {len(df)} images from dataset")
     print(f"  - Class distribution:\n{df['diagnosis'].value_counts().sort_index()}\n")
     
-    # Split data
-    train_size = int(len(df) * Config.TRAIN_RATIO)
-    val_size = int(len(df) * Config.VAL_RATIO)
+    # Stratified split data to maintain class distribution
+    print("Performing stratified data split...")
     
-    train_df = df[:train_size].reset_index(drop=True)
-    val_df = df[train_size:train_size+val_size].reset_index(drop=True)
-    test_df = df[train_size+val_size:].reset_index(drop=True)
+    # First split: separate test set (stratified)
+    train_val_df, test_df = train_test_split(
+        df,
+        test_size=Config.TEST_RATIO,
+        stratify=df['diagnosis'],
+        random_state=Config.RANDOM_SEED
+    )
     
-    print(f"Data split:")
+    # Second split: separate train and val sets (stratified)
+    # Adjust val_ratio relative to remaining data
+    val_ratio_adjusted = Config.VAL_RATIO / (Config.TRAIN_RATIO + Config.VAL_RATIO)
+    train_df, val_df = train_test_split(
+        train_val_df,
+        test_size=val_ratio_adjusted,
+        stratify=train_val_df['diagnosis'],
+        random_state=Config.RANDOM_SEED
+    )
+    
+    # Reset indices
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+    
+    print(f"✓ Stratified data split complete:")
     print(f"  - Train: {len(train_df)} images")
     print(f"  - Val: {len(val_df)} images")
     print(f"  - Test: {len(test_df)} images\n")
+    
+    # VALIDATION: Check that all classes are present in training set
+    train_classes = set(train_df['diagnosis'].unique())
+    expected_classes = set(range(Config.NUM_CLASSES))
+    missing_classes = expected_classes - train_classes
+    
+    if missing_classes:
+        print(f"⚠️  WARNING: Missing classes in training set: {sorted(list(missing_classes))}")
+        print(f"   This can cause training errors. Consider adjusting data split ratios.")
+    else:
+        print(f"✓ All {Config.NUM_CLASSES} classes present in training set\n")
     
     # Data transforms
     train_transform, val_transform = get_data_transforms(augment=Config.AUGMENT)
