@@ -310,7 +310,13 @@ class DiabeticRetinopathyDataset(Dataset):
 
 
 def get_data_transforms(augment=True):
-    """Data augmentation and normalization"""
+    """
+    Data augmentation and normalization for fundus images.
+    
+    IMPORTANT: Fundus images have specific anatomical orientation.
+    Do NOT use RandomHorizontalFlip or RandomVerticalFlip as these
+    change the eye structure and lead to poor generalization.
+    """
     
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -318,14 +324,36 @@ def get_data_transforms(augment=True):
     )
     
     if augment:
-        # NOTE: Image already resized to 512x512 in preprocessor, skip Resize here
+        # ✓ CORRECT augmentation for fundus images
         train_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(20),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+            # ✓ Small rotations (±10°) - fundus images can be rotated slightly
+            transforms.RandomRotation(10, fill=0),
+            
+            # ✓ Small translations - optical disk might be slightly off-center
+            transforms.RandomAffine(
+                degrees=0,
+                translate=(0.05, 0.05),
+                fill=0
+            ),
+            
+            # ✓ Color jittering - accounts for different imaging equipment
+            transforms.ColorJitter(
+                brightness=0.3,
+                contrast=0.3,
+                saturation=0.2,
+                hue=0.1
+            ),
+            
+            # ✓ Subtle blur - accounts for slight focus variations
+            transforms.GaussianBlur(
+                kernel_size=3,
+                sigma=(0.1, 1.0)
+            ),
+            
+            # ❌ DO NOT USE - corrupts fundus anatomy:
+            # transforms.RandomHorizontalFlip(p=0.5),
+            # transforms.RandomVerticalFlip(p=0.5),
+            
             transforms.ToTensor(),
             normalize
         ])
