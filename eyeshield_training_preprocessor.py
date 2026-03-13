@@ -212,11 +212,12 @@ class Config:
     
     # Image Preprocessing
     TARGET_IMAGE_SIZE = (512, 512)  # Your preferred size for training
-    QUALITY_CHECK = True            # Assess image quality
+    QUALITY_CHECK = False            # Assess image quality (disabled for speed/memory)
     
     # Dataset paths
     KAGGLE_DATASET_PATH = '/kaggle/input'
     COLAB_DRIVE_PATH = '/content/drive/MyDrive'
+    MAX_DATASET_SIZE = 60000  # Limit dataset to N images for faster training (set to None for all)
     
     # Model parameters
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
@@ -244,11 +245,15 @@ class Config:
     CHECKPOINT_DIR = './checkpoints'
     LOG_DIR = './logs'
     SAVE_INTERVAL = 5
+    MAX_CHECKPOINTS = 3  # Keep only top 3 checkpoints
     
     # Augmentation
     AUGMENT = True
     RANDOM_SEED = 42
-    NUM_WORKERS = 4
+    
+    # Data loading (auto-detected based on device)
+    # NUM_WORKERS will be set based on platform (0 for Colab, 4 for local)
+    NUM_WORKERS = 0 if torch.cuda.is_available() and 'COLAB_RELEASE_TAG' in os.environ else 4
 
 
 # ==================== DATA LOADING WITH YOUR PREPROCESSOR ====================
@@ -313,8 +318,8 @@ def get_data_transforms(augment=True):
     )
     
     if augment:
+        # NOTE: Image already resized to 512x512 in preprocessor, skip Resize here
         train_transform = transforms.Compose([
-            transforms.Resize((512, 512)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
             transforms.RandomRotation(20),
@@ -326,13 +331,11 @@ def get_data_transforms(augment=True):
         ])
     else:
         train_transform = transforms.Compose([
-            transforms.Resize((512, 512)),
             transforms.ToTensor(),
             normalize
         ])
     
     val_transform = transforms.Compose([
-        transforms.Resize((512, 512)),
         transforms.ToTensor(),
         normalize
     ])
@@ -780,6 +783,10 @@ class Trainer:
                 if patience_counter >= patience:
                     print(f"\nEarly stopping at epoch {epoch+1} (validation loss did not improve)")
                     break
+            
+            # Clear cache to prevent memory fragmentation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         print("\n" + "="*80)
         print("Training Complete!")
@@ -1019,6 +1026,20 @@ def main():
     if len(df) == 0:
         raise ValueError(f"Dataset CSV is empty at: {csv_path}")
     
+    # Limit dataset size if MAX_DATASET_SIZE is set
+    if Config.MAX_DATASET_SIZE is not None and len(df) > Config.MAX_DATASET_SIZE:
+        print(f"⚠️  Limiting dataset from {len(df)} → {Config.MAX_DATASET_SIZE} images")
+        # Sample uniformly from each class to maintain stratification
+        df = df.groupby('diagnosis', group_keys=False).apply(
+            lambda x: x.sample(n=max(1, int(Config.MAX_DATASET_SIZE * len(x) / len(df))), random_state=Config.RANDOM_SEED)
+        ).reset_index(drop=True)
+        
+        # If still over limit, randomly sample
+        if len(df) > Config.MAX_DATASET_SIZE:
+            df = df.sample(n=Config.MAX_DATASET_SIZE, random_state=Config.RANDOM_SEED).reset_index(drop=True)
+    
+    print(f"✓ Using {len(df)} images for training")
+    
     # If using the Kaggle download from the notebook
     import kagglehub
     dataset_root = kagglehub.dataset_download("ascanipek/eyepacs-aptos-messidor-diabetic-retinopathy")
@@ -1091,12 +1112,14 @@ def main():
     )
     
     # Use WeightedRandomSampler for training to handle class imbalance
+    pin_memory = torch.cuda.is_available()  # Only pin memory if GPU available
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=Config.BATCH_SIZE,
         sampler=class_sampler,  # Use weighted sampler for balanced batches
         num_workers=Config.NUM_WORKERS,
-        pin_memory=True
+        pin_memory=pin_memory
     )
     
     val_loader = DataLoader(
@@ -1104,7 +1127,7 @@ def main():
         batch_size=Config.BATCH_SIZE,
         shuffle=False,
         num_workers=Config.NUM_WORKERS,
-        pin_memory=True
+        pin_memory=pin_memory
     )
     
     # Initialize model
