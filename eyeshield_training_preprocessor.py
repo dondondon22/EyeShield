@@ -485,7 +485,7 @@ class EvidentialLoss(nn.Module):
         if class_weights is not None:
             self.register_buffer('class_weights', class_weights)
         else:
-            self.class_weights = torch.ones(num_classes)
+            self.register_buffer('class_weights', torch.ones(num_classes))
     
     def forward(self, evidence, targets, epoch, annealing_step):
         """Compute EDL loss with annealing KL regularization and class weights"""
