@@ -604,6 +604,7 @@ class Trainer:
             kl_weight=config.KL_WEIGHT,
             class_weights=class_weights
         )
+        self.criterion = self.criterion.to(self.device)
         self.optimizer = optim.AdamW(
             model.parameters(),
             lr=config.LEARNING_RATE,
