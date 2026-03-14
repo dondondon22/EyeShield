@@ -229,7 +229,18 @@ class ImageCacheManager:
         Returns:
             str: Path to cached .npy file
         """
+        # Use a flattened filename so cache files always live directly under cache_dir
+        # and work consistently across OS path separator conventions.
+        safe_filename = str(image_filename).replace('/', '__').replace('\\', '__')
+        return os.path.join(self.cache_dir, f"{safe_filename}.npy")
+
+    def _get_legacy_cache_path(self, image_filename):
+        """Legacy cache path used by earlier versions (kept for backward compatibility)."""
         return os.path.join(self.cache_dir, f"{image_filename}.npy")
+
+    def cache_exists(self, image_filename):
+        """Check whether cache exists in either new or legacy naming format."""
+        return os.path.exists(self.get_cache_path(image_filename)) or os.path.exists(self._get_legacy_cache_path(image_filename))
     
     def preprocess_and_cache(self, df, dataset_root, force_reprocess=False):
         """
@@ -259,9 +270,10 @@ class ImageCacheManager:
         for idx, row in df.iterrows():
             img_path = os.path.join(dataset_root, row['image_path'])
             cache_path = self.get_cache_path(row['image_path'])
+            legacy_cache_path = self._get_legacy_cache_path(row['image_path'])
             
             # If already cached and not forcing reprocessing, skip
-            if os.path.exists(cache_path) and not force_reprocess:
+            if (os.path.exists(cache_path) or os.path.exists(legacy_cache_path)) and not force_reprocess:
                 cached_count += 1
                 cache_metadata[row['image_path']] = 'cached'
                 pbar.update(1)
@@ -280,6 +292,7 @@ class ImageCacheManager:
                     continue
                 
                 # Save as NumPy binary (.npy) for fast I/O
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                 np.save(cache_path, preprocessed_img.astype(np.float32))
                 new_count += 1
                 cache_metadata[row['image_path']] = 'new'
@@ -331,9 +344,19 @@ class ImageCacheManager:
             FileNotFoundError: If cached image doesn't exist
         """
         cache_path = self.get_cache_path(image_filename)
-        if not os.path.exists(cache_path):
-            raise FileNotFoundError(f"Cached image not found: {cache_path}")
-        return np.load(cache_path)
+        legacy_cache_path = self._get_legacy_cache_path(image_filename)
+
+        if os.path.exists(cache_path):
+            return np.load(cache_path)
+
+        if os.path.exists(legacy_cache_path):
+            return np.load(legacy_cache_path)
+
+        raise FileNotFoundError(
+            f"Cached image not found in either format:\n"
+            f"  - New: {cache_path}\n"
+            f"  - Legacy: {legacy_cache_path}"
+        )
     
     def clear_cache(self):
         """Clear all cached images from disk"""
@@ -379,11 +402,12 @@ class ImageCacheManager:
         """
         total_size = 0
         if os.path.exists(self.cache_dir):
-            for file in os.listdir(self.cache_dir):
-                if file.endswith('.npy'):  # Only count .npy cache files
-                    file_path = os.path.join(self.cache_dir, file)
-                    if os.path.isfile(file_path):
-                        total_size += os.path.getsize(file_path)
+            for root, _, files in os.walk(self.cache_dir):
+                for file in files:
+                    if file.endswith('.npy'):  # Only count .npy cache files
+                        file_path = os.path.join(root, file)
+                        if os.path.isfile(file_path):
+                            total_size += os.path.getsize(file_path)
         return total_size / (1024**3)
 
 

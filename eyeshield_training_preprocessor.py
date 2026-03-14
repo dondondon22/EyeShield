@@ -899,6 +899,106 @@ def visualize_class_distribution(train_df, val_df, test_df, class_weights, log_d
     print("="*80 + "\n")
 
 
+def resolve_dataset_root(df):
+    """
+    Resolve a dataset root that matches relative paths stored in labels.csv.
+
+    Priority:
+      1) /content/dataset/data_root.txt (saved by the notebook CSV step)
+      2) kagglehub download root (+ common nested subfolders)
+      3) common Kaggle input paths
+      4) bounded recursive search fallback
+    """
+    if len(df) == 0:
+        raise ValueError("Cannot resolve dataset root: dataframe is empty.")
+
+    sample_rel_path = str(df.iloc[0]['image_path']).lstrip('/\\')
+    candidate_roots = []
+
+    # 1) Prefer exact root saved during CSV creation
+    data_root_file = '/content/dataset/data_root.txt'
+    if os.path.exists(data_root_file):
+        try:
+            with open(data_root_file, 'r') as f:
+                saved_root = f.read().strip()
+            if saved_root:
+                candidate_roots.append(saved_root)
+        except Exception as e:
+            print(f"⚠ Could not read {data_root_file}: {e}")
+
+    # 2) kagglehub + common nested layouts
+    try:
+        import kagglehub
+        kagglehub_root = kagglehub.dataset_download("ascanipek/eyepacs-aptos-messidor-diabetic-retinopathy")
+        candidate_roots.extend([
+            kagglehub_root,
+            os.path.join(kagglehub_root, 'dr_unified_v2'),
+            os.path.join(kagglehub_root, 'dr_unified_v2', 'dr_unified_v2'),
+        ])
+    except Exception as e:
+        print(f"⚠ Could not resolve kagglehub root automatically: {e}")
+
+    # 3) Common Kaggle mounted paths
+    candidate_roots.extend([
+        '/kaggle/input/eyepacs-aptos-messidor-diabetic-retinopathy',
+        '/kaggle/input/eyepacs-aptos-messidor-diabetic-retinopathy/dr_unified_v2',
+        '/kaggle/input/eyepacs-aptos-messidor-diabetic-retinopathy/dr_unified_v2/dr_unified_v2',
+    ])
+
+    # De-duplicate while preserving order
+    unique_roots = []
+    seen = set()
+    for root in candidate_roots:
+        if not root:
+            continue
+        norm_root = os.path.normpath(root)
+        if norm_root not in seen:
+            seen.add(norm_root)
+            unique_roots.append(norm_root)
+
+    print("Resolving dataset root...")
+    for root in unique_roots:
+        if os.path.exists(os.path.join(root, sample_rel_path)):
+            print(f"✓ Dataset root resolved: {root}")
+            return root
+
+    # 4) Fallback search (bounded depth)
+    search_bases = ['/kaggle/input', '/root/.cache/kagglehub']
+    for base in search_bases:
+        if not os.path.isdir(base):
+            continue
+        print(f"  Searching recursively under: {base}")
+        for current_root, dirs, _ in os.walk(base):
+            depth = os.path.relpath(current_root, base).count(os.sep)
+            if depth > 5:
+                dirs[:] = []
+                continue
+            if os.path.exists(os.path.join(current_root, sample_rel_path)):
+                print(f"✓ Dataset root discovered via search: {current_root}")
+                return current_root
+
+    raise FileNotFoundError(
+        "Could not resolve dataset root for CSV paths.\n"
+        f"Sample relative path: {sample_rel_path}\n"
+        "Expected this file under one of the dataset roots, but it was not found.\n"
+        "Please re-run 'Prepare Dataset CSV' so data_root.txt is regenerated correctly."
+    )
+
+
+def filter_to_cached_images(df, cache_manager, split_name):
+    """Keep only rows with existing cached .npy files (new or legacy cache format)."""
+    keep_mask = df['image_path'].apply(cache_manager.cache_exists)
+    filtered_df = df[keep_mask].reset_index(drop=True)
+    dropped = len(df) - len(filtered_df)
+
+    if dropped > 0:
+        print(f"⚠ {split_name}: Dropped {dropped} samples missing cached files")
+    else:
+        print(f"✓ {split_name}: All samples have cached files")
+
+    return filtered_df
+
+
 def main():
     """Main training function"""
     
@@ -956,10 +1056,10 @@ def main():
     
     print(f"✓ Using {len(df)} images for training")
     
-    # If using the Kaggle download from the notebook
-    import kagglehub
-    dataset_root = kagglehub.dataset_download("ascanipek/eyepacs-aptos-messidor-diabetic-retinopathy")
+    # Resolve dataset root to match relative paths stored in labels.csv
+    dataset_root = resolve_dataset_root(df)
     print(f"✓ Loaded {len(df)} images from dataset")
+    print(f"  - Dataset root: {dataset_root}")
     print(f"  - Class distribution:\n{df['diagnosis'].value_counts().sort_index()}\n")
     
     # Stratified split data to maintain class distribution
@@ -1033,7 +1133,25 @@ def main():
     
     # Cache all images (train + val + test combined)
     all_images_df = pd.concat([train_df, val_df, test_df], ignore_index=True).drop_duplicates(subset=['image_path'])
-    cache_manager.preprocess_and_cache(all_images_df, dataset_root, force_reprocess=False)
+    cache_ok = cache_manager.preprocess_and_cache(all_images_df, dataset_root, force_reprocess=False)
+    if not cache_ok:
+        print("⚠ Some images failed during caching; training will continue with available cached images.")
+
+    # Keep only samples that have cache files so DataLoader never hits missing-cache errors
+    train_df = filter_to_cached_images(train_df, cache_manager, split_name='Train')
+    val_df = filter_to_cached_images(val_df, cache_manager, split_name='Val')
+
+    if len(train_df) == 0:
+        raise RuntimeError(
+            "No training samples have cached images. "
+            "This usually means dataset_root does not match CSV relative paths."
+        )
+    if len(val_df) == 0:
+        raise RuntimeError("No validation samples have cached images. Cannot continue training.")
+
+    # Recalculate class sampler/weights after cache filtering to keep them consistent
+    print("Recalculating class weights after cache validation...")
+    class_sampler, class_weights = get_weighted_sampler(train_df, Config.NUM_CLASSES)
     
     print("✓ Images cached! Training will now load from cache (10x faster).\n")
     
