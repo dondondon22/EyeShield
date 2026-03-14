@@ -160,9 +160,9 @@ class Config:
     AUGMENT = True
     RANDOM_SEED = 42
     
-    # Data loading (auto-detected based on device)
-    # NUM_WORKERS will be set based on platform (0 for Colab, 4 for local)
-    NUM_WORKERS = 0 if torch.cuda.is_available() and 'COLAB_RELEASE_TAG' in os.environ else 4
+    # Data loading
+    # Fixed for better throughput during training on Colab and local runs.
+    NUM_WORKERS = 4
 
 
 # ==================== DATA LOADING WITH YOUR PREPROCESSOR ====================
