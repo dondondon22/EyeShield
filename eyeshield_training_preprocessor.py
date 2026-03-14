@@ -42,6 +42,71 @@ from torch.utils.data import WeightedRandomSampler
 # Image preprocessing and caching (separated module for efficiency)
 from image_processor import ImagePreprocessor, ImageCacheManager
 
+
+def apply_image_cache_manager_compatibility_patch():
+    """
+    Patch ImageCacheManager at runtime for backward compatibility.
+
+    This handles older image_processor.py versions that:
+    - Build nested cache paths like /content/image_cache/train/0/x.jpg.npy
+      (which can fail when parent dirs don't exist)
+    - Do not provide cache_exists()
+    - Cannot load legacy/new cache naming formats interchangeably
+    """
+
+    def _safe_get_cache_path(self, image_filename):
+        safe_filename = str(image_filename).replace('/', '__').replace('\\', '__')
+        return os.path.join(self.cache_dir, f"{safe_filename}.npy")
+
+    def _legacy_get_cache_path(self, image_filename):
+        return os.path.join(self.cache_dir, f"{image_filename}.npy")
+
+    def _cache_exists(self, image_filename):
+        return os.path.exists(_safe_get_cache_path(self, image_filename)) or os.path.exists(
+            _legacy_get_cache_path(self, image_filename)
+        )
+
+    def _load_cached_image(self, image_filename):
+        new_path = _safe_get_cache_path(self, image_filename)
+        legacy_path = _legacy_get_cache_path(self, image_filename)
+
+        if os.path.exists(new_path):
+            img = np.load(new_path)
+        elif os.path.exists(legacy_path):
+            img = np.load(legacy_path)
+        else:
+            raise FileNotFoundError(
+                f"Cached image not found in either format:\n"
+                f"  - New: {new_path}\n"
+                f"  - Legacy: {legacy_path}"
+            )
+
+        # Support both float32 cache and uint8 cache formats.
+        if img.dtype == np.uint8:
+            return img.astype(np.float32) / 255.0
+        return img.astype(np.float32)
+
+    def _get_cache_size_gb(self):
+        total_size = 0
+        if os.path.exists(self.cache_dir):
+            for root, _, files in os.walk(self.cache_dir):
+                for file in files:
+                    if file.endswith('.npy'):
+                        file_path = os.path.join(root, file)
+                        if os.path.isfile(file_path):
+                            total_size += os.path.getsize(file_path)
+        return total_size / (1024**3)
+
+    # Patch unconditionally so behavior is consistent across versions.
+    ImageCacheManager.get_cache_path = _safe_get_cache_path
+    ImageCacheManager._get_legacy_cache_path = _legacy_get_cache_path
+    ImageCacheManager.cache_exists = _cache_exists
+    ImageCacheManager.load_cached_image = _load_cached_image
+    ImageCacheManager._get_cache_size_gb = _get_cache_size_gb
+
+
+apply_image_cache_manager_compatibility_patch()
+
 # GPU/Device Setup
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
