@@ -7,36 +7,25 @@ Training Script for Google Colab
 """
 
 import os
-import sys
-import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 from tqdm import tqdm
-from datetime import datetime
 import warnings
-import pickle
-import shutil
-from pathlib import Path
 warnings.filterwarnings('ignore')
 
 # Deep Learning Framework
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
-import torchmetrics
 from torch.cuda.amp import autocast, GradScaler
 
 # For data handling
-from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, f1_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
-import cv2
 from PIL import Image
-import pydicom
 from torch.utils.data import WeightedRandomSampler
 
 # Image preprocessing and caching (separated module for efficiency)
@@ -123,9 +112,6 @@ class Config:
     TARGET_IMAGE_SIZE = (512, 512)  # Your preferred size for training
     QUALITY_CHECK = False            # Assess image quality (disabled for speed/memory)
     
-    # Dataset paths
-    KAGGLE_DATASET_PATH = '/kaggle/input'
-    COLAB_DRIVE_PATH = '/content/drive/MyDrive'
     MAX_DATASET_SIZE = 60000  # Limit dataset to N images for faster training (set to None for all)
     
     # Model parameters
@@ -140,7 +126,6 @@ class Config:
     EDL_UNCERTAINTY_THRESHOLD = 0.3
     KL_WEIGHT = 0.1
     ANNEALING_START = 10
-    ANNEALING_STEP = 1.0
     
     # Data split
     TRAIN_RATIO = 0.7
@@ -197,7 +182,7 @@ class DiabeticRetinopathyDataset(Dataset):
                                        f"  Expected path: {img_path}\n"
                                        f"  Please verify dataset paths in CSV are correct relative to dataset root.")
             
-            img, quality_score, quality_info = self.preprocessor.preprocess(
+            img, _, _ = self.preprocessor.preprocess(
                 img_path, assess_quality=Config.QUALITY_CHECK
             )
             
@@ -625,7 +610,7 @@ class Trainer:
         total_kl = 0
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config.NUM_EPOCHS}')
-        for batch_idx, (images, targets) in enumerate(pbar):
+        for images, targets in pbar:
             images = images.to(self.device)
             targets = targets.to(self.device)
             
