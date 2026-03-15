@@ -124,8 +124,8 @@ class Config:
     
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
-    KL_WEIGHT = 0.1
-    ANNEALING_START = 10
+    KL_WEIGHT = 0.2
+    ANNEALING_START = 5
     
     # Data split
     TRAIN_RATIO = 0.7
@@ -404,9 +404,9 @@ def calculate_class_weights(labels, num_classes):
         raise ValueError(f"Classes {list(empty_classes)} have 0 samples in training set. "
                         f"This will cause training failures. Use stratified splitting to ensure all classes are present.")
     
-    # Weight = total_samples / (num_classes * class_count)
-    # This is the effective number of samples method
-    class_weights = total_samples / (num_classes * (class_counts + 1e-6))
+    # Sqrt-dampened inverse frequency: softer than raw inverse frequency,
+    # prevents over-penalising Grade 0 when also using weighted loss (no sampler).
+    class_weights = np.sqrt(total_samples / (num_classes * (class_counts + 1e-6)))
     class_weights = class_weights / class_weights.sum() * num_classes  # Normalize
     
     return torch.tensor(class_weights, dtype=torch.float32)
@@ -578,7 +578,7 @@ class Trainer:
         )
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            mode='min',
+            mode='max',  # Track val macro F1 (higher is better)
             factor=0.5,
             patience=5,
             min_lr=1e-7
@@ -698,7 +698,7 @@ class Trainer:
     
     def train(self):
         """Full training loop"""
-        best_val_loss = float('inf')
+        best_val_f1 = 0.0
         patience_counter = 0
         patience = self.config.EARLY_STOPPING_PATIENCE  # Now configurable from Config
         
@@ -727,8 +727,8 @@ class Trainer:
             self.history['val_macro_f1'].append(val_metrics['macro_f1'])
             self.history['val_ece'].append(val_metrics['ece'])
             
-            # Update scheduler based on validation loss
-            self.scheduler.step(val_metrics['loss'])
+            # Update scheduler based on val macro F1 (more meaningful than loss on imbalanced data)
+            self.scheduler.step(val_metrics['macro_f1'])
             
             # Logging
             print(f"\nEpoch {epoch+1}/{self.config.NUM_EPOCHS}")
@@ -739,15 +739,15 @@ class Trainer:
             if (epoch + 1) % self.config.SAVE_INTERVAL == 0:
                 self.save_checkpoint(epoch, val_metrics['macro_f1'])
             
-            # Early stopping based on validation loss (more stable than accuracy for imbalanced data)
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
+            # Early stopping on val macro F1 — val loss is skewed by Grade 0 dominance
+            if val_metrics['macro_f1'] > best_val_f1:
+                best_val_f1 = val_metrics['macro_f1']
                 patience_counter = 0
                 self.save_best_model(epoch, val_metrics)
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print(f"\nEarly stopping at epoch {epoch+1} (validation loss did not improve)")
+                    print(f"\nEarly stopping at epoch {epoch+1} (val macro F1 did not improve)")
                     break
             
             # Clear cache to prevent memory fragmentation
@@ -1218,14 +1218,16 @@ def main():
     print(f"  - Val: {len(val_dataset)} images (cached)")
     print(f"  - Expected per-epoch time: ~6 minutes (down from 58 minutes)\n")
     
-    # Use WeightedRandomSampler for training to handle class imbalance
-    pin_memory = torch.cuda.is_available()  # Only pin memory if GPU available
+    pin_memory = torch.cuda.is_available()
     
-    # DataLoaders remain the same - they'll load from cache instead of preprocessing files
+    # Shuffle + class-weighted loss handles imbalance without distorting the learned class prior.
+    # WeightedRandomSampler was removed: it made batches ~uniform across grades, causing the model
+    # to learn P(grade) ≈ 0.2 for all classes. Combined with the loss class weights that was
+    # double compensation, leading to over-predicting rare grades on the real-distribution val set.
     train_loader = DataLoader(
         train_dataset,
         batch_size=Config.BATCH_SIZE,
-        sampler=class_sampler,  # Use weighted sampler for balanced batches
+        shuffle=True,
         num_workers=Config.NUM_WORKERS,
         pin_memory=pin_memory
     )
