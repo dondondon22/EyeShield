@@ -124,8 +124,11 @@ class Config:
     
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
-    KL_WEIGHT = 0.2
-    ANNEALING_START = 5
+    KL_WEIGHT = 0.1   # Paper default; 0.2 was too aggressive and suppressed evidence early
+    ANNEALING_START = 20  # Ramp KL over 20 epochs so backbone features stabilise first
+    
+    # Backbone freeze: train EDL head only for first N epochs, then unfreeze at LR/10
+    BACKBONE_FREEZE_EPOCHS = 5
     
     # Data split
     TRAIN_RATIO = 0.7
@@ -362,20 +365,49 @@ class EfficientNetB3EDL(nn.Module):
         return evidence
     
     def predict(self, evidence):
-        """Convert evidence to Dirichlet parameters and predictions"""
+        """Convert evidence to Dirichlet parameters and uncertainty decomposition.
+
+        Returns three distinct uncertainty quantities:
+          - vacuity      : epistemic uncertainty from lack of evidence  (K/S)
+          - aleatoric    : expected categorical entropy under the Dirichlet
+                           = -sum_k (alpha_k/S) * (digamma(alpha_k+1) - digamma(S+1))
+          - epistemic    : mutual information  = H[mean_pred] - aleatoric
+        """
         alpha = evidence + 1  # α_k = e_k + 1
         S = torch.sum(alpha, dim=1, keepdim=True)  # Dirichlet strength
-        belief = alpha / S  # Belief masses
-        uncertainty = self.num_classes / S  # Total uncertainty
-        confidence = 1 - uncertainty  # Confidence
-        
+        belief = alpha / S  # Mean class probabilities (projected Dirichlet)
+
+        # -- Vacuity (epistemic from evidence deficit) --
+        # High when total evidence S is low, regardless of where it is concentrated.
+        vacuity = self.num_classes / S
+
+        # -- Aleatoric uncertainty --
+        # Expected entropy of the categorical distribution under the Dirichlet prior.
+        # Measures irreducible class-overlap / label noise.
+        aleatoric = -torch.sum(
+            belief * (torch.digamma(alpha + 1) - torch.digamma(S + 1)),
+            dim=1, keepdim=True
+        )
+
+        # -- Epistemic uncertainty (BALD / mutual information) --
+        # Total entropy of the mean prediction minus aleatoric.
+        # Measures reducible model uncertainty.
+        eps = 1e-8
+        total_entropy = -torch.sum(belief * torch.log(belief + eps), dim=1, keepdim=True)
+        epistemic = torch.clamp(total_entropy - aleatoric, min=0.0)
+
         return {
             'evidence': evidence,
             'alpha': alpha,
             'belief': belief,
             'S': S,
-            'uncertainty': uncertainty,
-            'confidence': confidence,
+            'vacuity': vacuity,
+            'aleatoric_uncertainty': aleatoric,
+            'epistemic_uncertainty': epistemic,
+            'total_uncertainty': total_entropy,
+            # Legacy keys kept so Trainer / EDLMetrics don't break
+            'uncertainty': vacuity,
+            'confidence': 1 - vacuity,
             'pred': torch.argmax(belief, dim=1)
         }
 
@@ -508,6 +540,9 @@ class EDLMetrics:
         self.targets = []
         self.uncertainties = []
         self.confidences = []
+        self.aleatoric_uncertainties = []
+        self.epistemic_uncertainties = []
+        self.vacuities = []
     
     def update(self, output, targets):
         """Update metrics with batch results"""
@@ -516,6 +551,9 @@ class EDLMetrics:
         # Use view(-1) instead of squeeze to avoid shape issues with batch_size=1
         self.uncertainties.extend(output['uncertainty'].view(-1).cpu().detach().numpy())
         self.confidences.extend(output['confidence'].view(-1).cpu().detach().numpy())
+        self.aleatoric_uncertainties.extend(output['aleatoric_uncertainty'].view(-1).cpu().detach().numpy())
+        self.epistemic_uncertainties.extend(output['epistemic_uncertainty'].view(-1).cpu().detach().numpy())
+        self.vacuities.extend(output['vacuity'].view(-1).cpu().detach().numpy())
     
     def compute(self):
         """Compute all metrics"""
@@ -542,6 +580,10 @@ class EDLMetrics:
                 avg_acc = np.mean(preds[mask] == targets[mask])
                 ece += np.abs(avg_conf - avg_acc) * np.sum(mask) / len(targets)
         
+        aleatoric_uncertainties = np.array(self.aleatoric_uncertainties)
+        epistemic_uncertainties = np.array(self.epistemic_uncertainties)
+        vacuities = np.array(self.vacuities)
+
         return {
             'accuracy': accuracy,
             'macro_f1': macro_f1,
@@ -549,6 +591,9 @@ class EDLMetrics:
             'ece': ece,
             'mean_uncertainty': np.mean(uncertainties),
             'mean_confidence': np.mean(confidences),
+            'mean_vacuity': np.mean(vacuities),
+            'mean_aleatoric': np.mean(aleatoric_uncertainties),
+            'mean_epistemic': np.mean(epistemic_uncertainties),
             'confusion_matrix': confusion_matrix(targets, preds, labels=range(self.num_classes))
         }
 
@@ -571,17 +616,23 @@ class Trainer:
             class_weights=class_weights
         )
         self.criterion = self.criterion.to(self.device)
+
+        # Phase 1: freeze backbone so random EDL-head gradients don't corrupt pretrained features.
+        # Backbone will be unfrozen at BACKBONE_FREEZE_EPOCHS with a 10× lower LR.
+        for param in model.backbone.parameters():
+            param.requires_grad = False
+
         self.optimizer = optim.AdamW(
-            model.parameters(),
+            model.edl_head.parameters(),
             lr=config.LEARNING_RATE,
             weight_decay=config.WEIGHT_DECAY
         )
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='max',  # Track val macro F1 (higher is better)
-            factor=0.5,
+            factor=0.7,  # Less aggressive than 0.5; prevents LR collapsing before early stopping fires
             patience=5,
-            min_lr=1e-7
+            min_lr=1e-6
         )
         
         # Mixed precision training
@@ -593,7 +644,8 @@ class Trainer:
         # History
         self.history = {
             'train_loss': [], 'train_nll': [], 'train_kl': [], 'train_acc': [], 'train_macro_f1': [],
-            'val_loss': [], 'val_nll': [], 'val_kl': [], 'val_acc': [], 'val_macro_f1': [], 'val_ece': []
+            'val_loss': [], 'val_nll': [], 'val_kl': [], 'val_acc': [], 'val_macro_f1': [], 'val_ece': [],
+            'val_vacuity': [], 'val_aleatoric': [], 'val_epistemic': []
         }
         
         # Create checkpoint directory
@@ -693,6 +745,9 @@ class Trainer:
             'accuracy': val_metrics['accuracy'],
             'macro_f1': val_metrics['macro_f1'],
             'ece': val_metrics['ece'],
+            'mean_vacuity': val_metrics['mean_vacuity'],
+            'mean_aleatoric': val_metrics['mean_aleatoric'],
+            'mean_epistemic': val_metrics['mean_epistemic'],
             'confusion_matrix': val_metrics['confusion_matrix']
         }
     
@@ -708,6 +763,19 @@ class Trainer:
         print("="*80 + "\n")
         
         for epoch in range(self.config.NUM_EPOCHS):
+            # Phase 2: unfreeze backbone with differential LR after warmup
+            if epoch == self.config.BACKBONE_FREEZE_EPOCHS:
+                print(f"\n→ Unfreezing backbone at epoch {epoch + 1}. "
+                      f"Backbone LR: {self.config.LEARNING_RATE / 10:.2e}, "
+                      f"Head LR: {self.config.LEARNING_RATE:.2e}")
+                for param in self.model.backbone.parameters():
+                    param.requires_grad = True
+                self.optimizer.add_param_group({
+                    'params': list(self.model.backbone.parameters()),
+                    'lr': self.config.LEARNING_RATE / 10,
+                    'weight_decay': self.config.WEIGHT_DECAY
+                })
+
             # Train
             train_metrics = self.train_epoch(epoch)
             
@@ -726,6 +794,9 @@ class Trainer:
             self.history['val_acc'].append(val_metrics['accuracy'])
             self.history['val_macro_f1'].append(val_metrics['macro_f1'])
             self.history['val_ece'].append(val_metrics['ece'])
+            self.history['val_vacuity'].append(val_metrics['mean_vacuity'])
+            self.history['val_aleatoric'].append(val_metrics['mean_aleatoric'])
+            self.history['val_epistemic'].append(val_metrics['mean_epistemic'])
             
             # Update scheduler based on val macro F1 (more meaningful than loss on imbalanced data)
             self.scheduler.step(val_metrics['macro_f1'])
@@ -734,6 +805,7 @@ class Trainer:
             print(f"\nEpoch {epoch+1}/{self.config.NUM_EPOCHS}")
             print(f"Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.4f} | Train Macro F1: {train_metrics['macro_f1']:.4f}")
             print(f"Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | Val Macro F1: {val_metrics['macro_f1']:.4f} | ECE: {val_metrics['ece']:.4f}")
+            print(f"Uncertainty — Vacuity: {val_metrics['mean_vacuity']:.4f} | Aleatoric: {val_metrics['mean_aleatoric']:.4f} | Epistemic: {val_metrics['mean_epistemic']:.4f}")
             
             # Save checkpoint
             if (epoch + 1) % self.config.SAVE_INTERVAL == 0:
