@@ -119,13 +119,13 @@ class Config:
     INPUT_SIZE = (512, 512)
     BATCH_SIZE = 32
     NUM_EPOCHS = 100
-    LEARNING_RATE = 5e-5
-    WEIGHT_DECAY = 2e-4
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-4
     
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
-    KL_WEIGHT = 0.2
-    ANNEALING_START = 3
+    KL_WEIGHT = 0.15
+    ANNEALING_START = 7
     LABEL_SMOOTHING = 0.1
 
     # Mixup augmentation
