@@ -125,7 +125,7 @@ class Config:
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
     KL_WEIGHT = 0.15
-    ANNEALING_START = 7
+    ANNEALING_START = 10
     LABEL_SMOOTHING = 0.1
 
     # Mixup augmentation
