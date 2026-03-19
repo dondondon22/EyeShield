@@ -502,16 +502,22 @@ class EvidentialLoss(nn.Module):
     def forward(self, evidence, targets, epoch, annealing_step):
         """Compute EDL loss with annealing KL regularization and class weights"""
         
-        # Convert targets to one-hot if needed
+        # Build hard targets for KL direction and class weighting.
+        # If soft labels are provided, use the dominant class to keep weighting stable.
         if targets.dim() == 1:
-            targets_one_hot = torch.zeros(targets.size(0), self.num_classes, device=targets.device)
-            targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+            target_indices = targets.long()
+            hard_targets_one_hot = torch.zeros(targets.size(0), self.num_classes, device=targets.device)
+            hard_targets_one_hot.scatter_(1, target_indices.unsqueeze(1), 1.0)
+            nll_targets = hard_targets_one_hot
         else:
-            targets_one_hot = targets
+            target_indices = torch.argmax(targets, dim=1).long()
+            hard_targets_one_hot = torch.zeros(targets.size(0), self.num_classes, device=targets.device)
+            hard_targets_one_hot.scatter_(1, target_indices.unsqueeze(1), 1.0)
+            nll_targets = targets
 
-        # Label smoothing improves calibration and reduces over-confident evidence spikes.
-        if self.label_smoothing > 0:
-            targets_one_hot = targets_one_hot * (1.0 - self.label_smoothing) + (
+        # Apply label smoothing only to the NLL target path.
+        if self.label_smoothing > 0 and targets.dim() == 1:
+            nll_targets = nll_targets * (1.0 - self.label_smoothing) + (
                 self.label_smoothing / self.num_classes
             )
         
@@ -521,17 +527,17 @@ class EvidentialLoss(nn.Module):
         
         # Negative log-likelihood (MSE variant)
         belief = alpha / S
-        nll_loss = torch.sum((targets_one_hot - belief) ** 2, dim=1, keepdim=True)
+        nll_loss = torch.sum((nll_targets - belief) ** 2, dim=1, keepdim=True)
         nll_loss += torch.sum(alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True)
         
         # Apply class weights
-        class_weight_targets = self.class_weights[targets].unsqueeze(1)
+        class_weight_targets = self.class_weights[target_indices].unsqueeze(1)
         nll_loss = nll_loss * class_weight_targets
         
         # KL regularization with annealing
         lam = min(1.0, epoch / annealing_step) if epoch < annealing_step else 1.0
         
-        kl_alpha = (alpha - 1) * (1 - targets_one_hot)
+        kl_alpha = (alpha - 1) * (1 - hard_targets_one_hot)
         kl_loss = lam * torch.sum(
             torch.lgamma(torch.sum(alpha, dim=1, keepdim=True)) - 
             torch.sum(torch.lgamma(alpha), dim=1, keepdim=True) +
@@ -705,24 +711,17 @@ class Trainer:
             images = images.to(self.device)
             targets = targets.to(self.device)
             images, targets_a, targets_b, lam = self.apply_mixup(images, targets)
+            # Use dominant hard target for weighted EDL loss stability under Mixup.
+            dominant_targets = targets_a if lam >= 0.5 else targets_b
             
             self.optimizer.zero_grad()
             
             # Forward pass with mixed precision
             with autocast():
                 evidence = self.model(images)
-                loss_a, nll_a, kl_a = self.criterion(
-                    evidence, targets_a, epoch, self.config.ANNEALING_START
+                loss, nll_loss, kl_loss = self.criterion(
+                    evidence, dominant_targets, epoch, self.config.ANNEALING_START
                 )
-                if lam < 1.0:
-                    loss_b, nll_b, kl_b = self.criterion(
-                        evidence, targets_b, epoch, self.config.ANNEALING_START
-                    )
-                    loss = lam * loss_a + (1.0 - lam) * loss_b
-                    nll_loss = lam * nll_a + (1.0 - lam) * nll_b
-                    kl_loss = lam * kl_a + (1.0 - lam) * kl_b
-                else:
-                    loss, nll_loss, kl_loss = loss_a, nll_a, kl_a
             
             # Backward pass
             self.scaler.scale(loss).backward()
@@ -734,8 +733,7 @@ class Trainer:
             # Get predictions
             with torch.no_grad():
                 output = self.model.predict(evidence)
-                metric_targets = targets_a if lam >= 0.5 else targets_b
-                self.metrics.update(output, metric_targets)
+                self.metrics.update(output, dominant_targets)
             
             total_loss += loss.item()
             total_nll += nll_loss.item()
