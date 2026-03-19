@@ -119,13 +119,17 @@ class Config:
     INPUT_SIZE = (512, 512)
     BATCH_SIZE = 32
     NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-4
+    LEARNING_RATE = 5e-5
+    WEIGHT_DECAY = 2e-4
     
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
-    KL_WEIGHT = 0.1   # Paper default; 0.2 was too aggressive and suppressed evidence early
-    ANNEALING_START = 20  # Ramp KL over 20 epochs so backbone features stabilise first
+    KL_WEIGHT = 0.2
+    ANNEALING_START = 3
+    LABEL_SMOOTHING = 0.1
+
+    # Mixup augmentation
+    MIXUP_ALPHA = 0.2
     
     # Backbone freeze: train EDL head only for first N epochs, then unfreeze at LR/10
     BACKBONE_FREEZE_EPOCHS = 5
@@ -376,6 +380,7 @@ class EfficientNetB3EDL(nn.Module):
         alpha = evidence + 1  # α_k = e_k + 1
         S = torch.sum(alpha, dim=1, keepdim=True)  # Dirichlet strength
         belief = alpha / S  # Mean class probabilities (projected Dirichlet)
+        max_belief = torch.max(belief, dim=1, keepdim=True).values
 
         # -- Vacuity (epistemic from evidence deficit) --
         # High when total evidence S is low, regardless of where it is concentrated.
@@ -407,7 +412,7 @@ class EfficientNetB3EDL(nn.Module):
             'total_uncertainty': total_entropy,
             # Legacy keys kept so Trainer / EDLMetrics don't break
             'uncertainty': vacuity,
-            'confidence': 1 - vacuity,
+            'confidence': max_belief,
             'pred': torch.argmax(belief, dim=1)
         }
 
@@ -471,13 +476,22 @@ def get_weighted_sampler(df, num_classes):
     return sampler, class_weights
 
 
+def boost_class_weight(class_weights, class_idx=1, boost_factor=2.0):
+    """Boost one class weight (default: Mild class) and renormalize."""
+    boosted_weights = class_weights.clone()
+    boosted_weights[class_idx] = boosted_weights[class_idx] * boost_factor
+    boosted_weights = boosted_weights / boosted_weights.sum() * len(boosted_weights)
+    return boosted_weights
+
+
 class EvidentialLoss(nn.Module):
     """Type-II Maximum Likelihood EDL Loss with Class Weights"""
     
-    def __init__(self, num_classes, kl_weight=0.1, class_weights=None):
+    def __init__(self, num_classes, kl_weight=0.1, class_weights=None, label_smoothing=0.1):
         super(EvidentialLoss, self).__init__()
         self.num_classes = num_classes
         self.kl_weight = kl_weight
+        self.label_smoothing = label_smoothing
         
         # Register class weights as buffer (will be moved to device with model)
         if class_weights is not None:
@@ -494,6 +508,12 @@ class EvidentialLoss(nn.Module):
             targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
         else:
             targets_one_hot = targets
+
+        # Label smoothing improves calibration and reduces over-confident evidence spikes.
+        if self.label_smoothing > 0:
+            targets_one_hot = targets_one_hot * (1.0 - self.label_smoothing) + (
+                self.label_smoothing / self.num_classes
+            )
         
         # Dirichlet parameters
         alpha = evidence + 1
@@ -550,7 +570,12 @@ class EDLMetrics:
         self.targets.extend(targets.cpu().numpy())
         # Use view(-1) instead of squeeze to avoid shape issues with batch_size=1
         self.uncertainties.extend(output['uncertainty'].view(-1).cpu().detach().numpy())
-        self.confidences.extend(output['confidence'].view(-1).cpu().detach().numpy())
+        # ECE should use max belief as confidence, not vacuity-derived confidence.
+        if 'belief' in output:
+            batch_confidences = torch.max(output['belief'], dim=1).values
+            self.confidences.extend(batch_confidences.view(-1).cpu().detach().numpy())
+        else:
+            self.confidences.extend(output['confidence'].view(-1).cpu().detach().numpy())
         self.aleatoric_uncertainties.extend(output['aleatoric_uncertainty'].view(-1).cpu().detach().numpy())
         self.epistemic_uncertainties.extend(output['epistemic_uncertainty'].view(-1).cpu().detach().numpy())
         self.vacuities.extend(output['vacuity'].view(-1).cpu().detach().numpy())
@@ -613,7 +638,8 @@ class Trainer:
         self.criterion = EvidentialLoss(
             config.NUM_CLASSES, 
             kl_weight=config.KL_WEIGHT,
-            class_weights=class_weights
+            class_weights=class_weights,
+            label_smoothing=config.LABEL_SMOOTHING
         )
         self.criterion = self.criterion.to(self.device)
 
@@ -651,6 +677,19 @@ class Trainer:
         # Create checkpoint directory
         os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(config.LOG_DIR, exist_ok=True)
+
+    def apply_mixup(self, images, targets):
+        """Apply mixup augmentation to a training batch."""
+        if self.config.MIXUP_ALPHA <= 0 or images.size(0) < 2:
+            return images, targets, targets, 1.0
+
+        lam = np.random.beta(self.config.MIXUP_ALPHA, self.config.MIXUP_ALPHA)
+        perm = torch.randperm(images.size(0), device=images.device)
+
+        mixed_images = lam * images + (1.0 - lam) * images[perm]
+        targets_a = targets
+        targets_b = targets[perm]
+        return mixed_images, targets_a, targets_b, float(lam)
     
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -665,15 +704,25 @@ class Trainer:
         for images, targets in pbar:
             images = images.to(self.device)
             targets = targets.to(self.device)
+            images, targets_a, targets_b, lam = self.apply_mixup(images, targets)
             
             self.optimizer.zero_grad()
             
             # Forward pass with mixed precision
             with autocast():
                 evidence = self.model(images)
-                loss, nll_loss, kl_loss = self.criterion(
-                    evidence, targets, epoch, self.config.ANNEALING_START
+                loss_a, nll_a, kl_a = self.criterion(
+                    evidence, targets_a, epoch, self.config.ANNEALING_START
                 )
+                if lam < 1.0:
+                    loss_b, nll_b, kl_b = self.criterion(
+                        evidence, targets_b, epoch, self.config.ANNEALING_START
+                    )
+                    loss = lam * loss_a + (1.0 - lam) * loss_b
+                    nll_loss = lam * nll_a + (1.0 - lam) * nll_b
+                    kl_loss = lam * kl_a + (1.0 - lam) * kl_b
+                else:
+                    loss, nll_loss, kl_loss = loss_a, nll_a, kl_a
             
             # Backward pass
             self.scaler.scale(loss).backward()
@@ -685,7 +734,8 @@ class Trainer:
             # Get predictions
             with torch.no_grad():
                 output = self.model.predict(evidence)
-                self.metrics.update(output, targets)
+                metric_targets = targets_a if lam >= 0.5 else targets_b
+                self.metrics.update(output, metric_targets)
             
             total_loss += loss.item()
             total_nll += nll_loss.item()
@@ -1232,6 +1282,7 @@ def main():
     # Calculate class weights for imbalanced data
     print("Calculating class weights for imbalanced data...")
     class_sampler, class_weights = get_weighted_sampler(train_df, Config.NUM_CLASSES)
+    class_weights = boost_class_weight(class_weights, class_idx=1, boost_factor=2.0)
     print("✓ Class weights calculated:")
     for i, weight in enumerate(class_weights):
         class_name = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative'][i]
@@ -1274,6 +1325,7 @@ def main():
     # Recalculate class sampler/weights after cache filtering to keep them consistent
     print("Recalculating class weights after cache validation...")
     class_sampler, class_weights = get_weighted_sampler(train_df, Config.NUM_CLASSES)
+    class_weights = boost_class_weight(class_weights, class_idx=1, boost_factor=2.0)
     
     print("✓ Images cached! Training will now load from cache (10x faster).\n")
     
