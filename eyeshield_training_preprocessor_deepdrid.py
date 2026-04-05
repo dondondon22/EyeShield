@@ -1126,6 +1126,8 @@ def resolve_dataset_root(df):
         '/kaggle/input/deepdrid/regular_fundus_images',
         '/kaggle/input/nancyhisham/deepdrid',
         '/content/dataset',
+        '/',
+        '',
     ])
 
     # De-duplicate while preserving order
