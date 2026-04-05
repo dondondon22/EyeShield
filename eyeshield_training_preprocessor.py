@@ -145,8 +145,6 @@ class Config:
     # Checkpoint and logging
     CHECKPOINT_DIR = './checkpoints'
     LOG_DIR = './logs'
-    SAVE_INTERVAL = 5
-    MAX_CHECKPOINTS = 3  # Keep only top 3 checkpoints
     
     # Augmentation
     AUGMENT = True
@@ -855,15 +853,11 @@ class Trainer:
             print(f"Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | Val Macro F1: {val_metrics['macro_f1']:.4f} | ECE: {val_metrics['ece']:.4f}")
             print(f"Uncertainty — Vacuity: {val_metrics['mean_vacuity']:.4f} | Aleatoric: {val_metrics['mean_aleatoric']:.4f} | Epistemic: {val_metrics['mean_epistemic']:.4f}")
             
-            # Save checkpoint
-            if (epoch + 1) % self.config.SAVE_INTERVAL == 0:
-                self.save_checkpoint(epoch, val_metrics['macro_f1'])
-            
             # Early stopping on val macro F1 — val loss is skewed by Grade 0 dominance
             if val_metrics['macro_f1'] > best_val_f1:
                 best_val_f1 = val_metrics['macro_f1']
                 patience_counter = 0
-                self.save_best_model(epoch, val_metrics)
+                self.save_best(epoch, val_metrics)
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -878,32 +872,22 @@ class Trainer:
         print("Training Complete!")
         print("="*80)
     
-    def save_checkpoint(self, epoch, metric_value):
-        """Save model checkpoint"""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state': self.model.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
-            'metric': metric_value
-        }
-        path = os.path.join(
-            self.config.CHECKPOINT_DIR,
-            f'checkpoint_epoch_{epoch+1}_f1_{metric_value:.4f}.pt'
-        )
-        torch.save(checkpoint, path)
-        print(f"Checkpoint saved: {path}")
-    
-    def save_best_model(self, epoch, val_metrics):
-        """Save best model"""
+    def save_best(self, epoch, val_metrics):
+        """Save best model and best checkpoint"""
+        # Save full checkpoint
         checkpoint = {
             'epoch': epoch,
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'val_metrics': val_metrics
         }
-        path = os.path.join(self.config.CHECKPOINT_DIR, 'best_model.pt')
-        torch.save(checkpoint, path)
-        print(f"Best model saved: {path}")
+        ckpt_path = os.path.join(self.config.CHECKPOINT_DIR, 'best_checkpoint.pt')
+        torch.save(checkpoint, ckpt_path)
+        
+        # Save only model weights
+        model_path = os.path.join(self.config.CHECKPOINT_DIR, 'best_model.pth')
+        torch.save(self.model.state_dict(), model_path)
+        print(f"Best model and checkpoint saved to {self.config.CHECKPOINT_DIR}")
     
     def plot_training_history(self):
         """Plot training history"""
