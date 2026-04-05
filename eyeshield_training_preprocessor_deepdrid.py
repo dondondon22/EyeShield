@@ -145,7 +145,7 @@ class Config:
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
     KL_WEIGHT = 0.1
-    ANNEALING_START = 10
+    ANNEALING_START = 20
     LABEL_SMOOTHING = 0.1
 
     # Mixup augmentation
@@ -731,7 +731,19 @@ class Trainer:
             images = images.to(self.device)
             targets = targets.to(self.device)
             images, targets_a, targets_b, lam = self.apply_mixup(images, targets)
-            # Use dominant hard target for weighted EDL loss stability under Mixup.
+            
+            if lam < 1.0:
+                # Create soft targets for Mixup training
+                targets_one_hot_a = torch.zeros(targets_a.size(0), self.config.NUM_CLASSES, device=images.device)
+                targets_one_hot_a.scatter_(1, targets_a.unsqueeze(1), 1.0)
+                targets_one_hot_b = torch.zeros(targets_b.size(0), self.config.NUM_CLASSES, device=images.device)
+                targets_one_hot_b.scatter_(1, targets_b.unsqueeze(1), 1.0)
+                
+                soft_targets = lam * targets_one_hot_a + (1.0 - lam) * targets_one_hot_b
+            else:
+                soft_targets = targets_a
+                
+            # Dominant targets represent the majority class (used primarily for metrics log accuracy)
             dominant_targets = targets_a if lam >= 0.5 else targets_b
             
             self.optimizer.zero_grad()
@@ -740,7 +752,7 @@ class Trainer:
             with autocast():
                 evidence = self.model(images)
                 loss, nll_loss, kl_loss = self.criterion(
-                    evidence, dominant_targets, epoch, self.config.ANNEALING_START
+                    evidence, soft_targets, epoch, self.config.ANNEALING_START
                 )
             
             # Backward pass
@@ -1096,6 +1108,13 @@ def resolve_dataset_root(df):
     if len(df) == 0:
         raise ValueError("Cannot resolve dataset root: dataframe is empty.")
 
+    # 0) Check if paths are already absolute and exist
+    probe_n = min(len(df), 64)
+    probe_paths = df['image_path'].sample(n=probe_n, random_state=42).tolist() if len(df) > probe_n else df['image_path'].tolist()
+    if sum(os.path.exists(str(p)) for p in probe_paths) > probe_n * 0.8: # If most exist
+        print("✓ CSV contains absolute paths that exist on disk. Using '' as dataset root.")
+        return ''
+
     candidate_roots = []
 
     # 1) Prefer exact root saved during CSV creation
@@ -1267,33 +1286,64 @@ def main():
     print(f"  - Class distribution:\n{df['diagnosis'].value_counts().sort_index()}\n")
     
     # Stratified split data to maintain class distribution
-    print("Performing stratified data split...")
-    
-    # First split: separate test set (stratified)
-    train_val_df, test_df = train_test_split(
-        df,
-        test_size=Config.TEST_RATIO,
-        stratify=df['diagnosis'],
-        random_state=Config.RANDOM_SEED
-    )
-    
-    # Second split: separate train and val sets (stratified)
-    # Adjust val_ratio relative to remaining data
-    val_ratio_adjusted = Config.VAL_RATIO / (Config.TRAIN_RATIO + Config.VAL_RATIO)
-    train_df, val_df = train_test_split(
-        train_val_df,
-        test_size=val_ratio_adjusted,
-        stratify=train_val_df['diagnosis'],
-        random_state=Config.RANDOM_SEED
-    )
-    
-    # Reset indices
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
-    
-    print(f"✓ Stratified data split complete:")
-    print(f"  - Train: {len(train_df)} images")
+    print("Performing data split...")
+
+    if 'split' in df.columns:
+        print("Using provided split column...")
+        
+        # Determine train vs unseen
+        train_df = df[df['split'] == 'train'].reset_index(drop=True)
+        unseen_df = df[df['split'] != 'train']
+        
+        # Of the unseen, what is explicitly validation
+        val_df = unseen_df[unseen_df['split'] == 'val'].reset_index(drop=True)
+        
+        # Test is anything else (e.g. 'test' or implicit leftovers)
+        test_df = unseen_df[unseen_df['split'] == 'test'].reset_index(drop=True)
+        
+        # If there is no explicit test set but we have validation data, maybe we need to split it
+        if len(test_df) == 0 and len(val_df) > 0:
+            print("No 'test' split found, splitting 'val' into val/test...")
+            val_df, test_df = train_test_split(
+                val_df,
+                test_size=0.5, # Split val in half to make test
+                stratify=val_df['diagnosis'],
+                random_state=Config.RANDOM_SEED
+            )
+            val_df = val_df.reset_index(drop=True)
+            test_df = test_df.reset_index(drop=True)
+
+        if len(train_df) == 0:
+            raise ValueError("No training data found in provided splits!")
+        if len(val_df) == 0:
+            raise ValueError("No validation data found in provided splits!")
+            
+    else:
+        print("Performing stratified data split...")
+        # First split: separate test set (stratified)
+        train_val_df, test_df = train_test_split(
+            df,
+            test_size=Config.TEST_RATIO,
+            stratify=df['diagnosis'],
+            random_state=Config.RANDOM_SEED
+        )
+
+        # Second split: separate train and val sets (stratified)
+        # Adjust val_ratio relative to remaining data
+        val_ratio_adjusted = Config.VAL_RATIO / (Config.TRAIN_RATIO + Config.VAL_RATIO)
+        train_df, val_df = train_test_split(
+            train_val_df,
+            test_size=val_ratio_adjusted,
+            stratify=train_val_df['diagnosis'],
+            random_state=Config.RANDOM_SEED
+        )
+
+        # Reset indices
+        train_df = train_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
+
+    print(f"✓ Data split complete:")
     print(f"  - Val: {len(val_df)} images")
     print(f"  - Test: {len(test_df)} images\n")
     
