@@ -1301,17 +1301,6 @@ def main():
         # Test is anything else (e.g. 'test' or implicit leftovers)
         test_df = unseen_df[unseen_df['split'] == 'test'].reset_index(drop=True)
         
-        # If there is no explicit test set but we have validation data, maybe we need to split it
-        if len(test_df) == 0 and len(val_df) > 0:
-            print("No 'test' split found, splitting 'val' into val/test...")
-            val_df, test_df = train_test_split(
-                val_df,
-                test_size=0.5, # Split val in half to make test
-                stratify=val_df['diagnosis'],
-                random_state=Config.RANDOM_SEED
-            )
-            val_df = val_df.reset_index(drop=True)
-            test_df = test_df.reset_index(drop=True)
 
         if len(train_df) == 0:
             raise ValueError("No training data found in provided splits!")
@@ -1361,18 +1350,7 @@ def main():
     # Data transforms
     train_transform, val_transform = get_data_transforms(augment=Config.AUGMENT)
     
-    # Calculate class weights for imbalanced data
-    print("Calculating class weights for imbalanced data...")
-    class_sampler, class_weights = get_weighted_sampler(train_df, Config.NUM_CLASSES)
-    class_weights = boost_class_weight(class_weights, class_idx=1, boost_factor=2.0)
-    print("✓ Class weights calculated:")
-    for i, weight in enumerate(class_weights):
-        class_name = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative'][i]
-        print(f"  - Class {i} ({class_name}): {weight:.4f}")
-    print()
-    
-    # Visualize class distribution
-    visualize_class_distribution(train_df, val_df, test_df, class_weights, Config.LOG_DIR)
+
     
     # ==================== CACHE IMAGES (ONE-TIME SETUP) ====================
     print("\n" + "="*80)
@@ -1404,10 +1382,17 @@ def main():
     if len(val_df) == 0:
         raise RuntimeError("No validation samples have cached images. Cannot continue training.")
 
-    # Recalculate class sampler/weights after cache filtering to keep them consistent
-    print("Recalculating class weights after cache validation...")
+    # Calculate class weights for imbalanced data (done AFTER cache filtering)
+    print("Calculating class weights for imbalanced data...")
     class_sampler, class_weights = get_weighted_sampler(train_df, Config.NUM_CLASSES)
-    class_weights = boost_class_weight(class_weights, class_idx=1, boost_factor=2.0)
+    print("? Class weights calculated:")
+    for i, weight in enumerate(class_weights):
+        class_name = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative'][i]
+        print(f"  - Class {i} ({class_name}): {weight:.4f}")
+    print()
+
+    # Visualize final class distribution
+    visualize_class_distribution(train_df, val_df, test_df, class_weights, Config.LOG_DIR)
     
     print("✓ Images cached! Training will now load from cache (10x faster).\n")
     
