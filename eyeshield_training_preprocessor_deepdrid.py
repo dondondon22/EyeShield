@@ -137,22 +137,22 @@ class Config:
     # Model parameters
     NUM_CLASSES = 5  # Grade 0-4: No DR, Mild, Moderate, Severe, Proliferative
     INPUT_SIZE = (512, 512)
-    BATCH_SIZE = 32
-    NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-4
+    BATCH_SIZE = 24
+    NUM_EPOCHS = 80
+    LEARNING_RATE = 6e-5
+    WEIGHT_DECAY = 5e-4
     
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
-    KL_WEIGHT = 0.1
-    ANNEALING_START = 25
-    LABEL_SMOOTHING = 0.1
+    KL_WEIGHT = 0.05
+    ANNEALING_START = 40
+    LABEL_SMOOTHING = 0.05
 
     # Mixup augmentation
-    MIXUP_ALPHA = 0.2
+    MIXUP_ALPHA = 0.35
     
     # Backbone freeze: train EDL head only for first N epochs, then unfreeze at LR/10
-    BACKBONE_FREEZE_EPOCHS = 5
+    BACKBONE_FREEZE_EPOCHS = 8
     
     # Data split
     TRAIN_RATIO = 0.7
@@ -160,7 +160,7 @@ class Config:
     TEST_RATIO = 0.15
     
     # Early stopping (patience for validation loss non-improvement)
-    EARLY_STOPPING_PATIENCE = 15
+    EARLY_STOPPING_PATIENCE = 10
     
     # Checkpoint and logging
     CHECKPOINT_DIR = './checkpoints'
