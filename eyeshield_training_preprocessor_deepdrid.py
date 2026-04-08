@@ -691,6 +691,13 @@ class Trainer:
         os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(config.LOG_DIR, exist_ok=True)
 
+    def _sync_scheduler_for_new_param_group(self, new_lr):
+        """Keep scheduler state aligned after adding a new optimizer param group."""
+        if hasattr(self.scheduler, 'base_lrs') and len(self.scheduler.base_lrs) < len(self.optimizer.param_groups):
+            self.scheduler.base_lrs.append(float(new_lr))
+        if hasattr(self.scheduler, '_last_lr') and len(self.scheduler._last_lr) < len(self.optimizer.param_groups):
+            self.scheduler._last_lr.append(float(new_lr))
+
     def apply_mixup(self, images, targets):
         """Apply mixup augmentation to a training batch."""
         if self.config.MIXUP_ALPHA <= 0 or images.size(0) < 2:
@@ -835,16 +842,19 @@ class Trainer:
         for epoch in range(self.config.NUM_EPOCHS):
             # Phase 2: unfreeze backbone with differential LR after warmup
             if epoch == self.config.BACKBONE_FREEZE_EPOCHS:
+                backbone_lr = self.config.LEARNING_RATE / 10
                 print(f"\n→ Unfreezing backbone at epoch {epoch + 1}. "
-                      f"Backbone LR: {self.config.LEARNING_RATE / 10:.2e}, "
+                      f"Backbone LR: {backbone_lr:.2e}, "
                       f"Head LR: {self.config.LEARNING_RATE:.2e}")
                 for param in self.model.backbone.parameters():
                     param.requires_grad = True
                 self.optimizer.add_param_group({
                     'params': list(self.model.backbone.parameters()),
-                    'lr': self.config.LEARNING_RATE / 10,
+                    'lr': backbone_lr,
                     'weight_decay': self.config.WEIGHT_DECAY
                 })
+                # CosineAnnealingWarmRestarts needs one base LR entry per optimizer param group.
+                self._sync_scheduler_for_new_param_group(backbone_lr)
 
             # Train
             train_metrics = self.train_epoch(epoch)
