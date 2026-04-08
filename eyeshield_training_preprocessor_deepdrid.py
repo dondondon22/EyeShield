@@ -139,20 +139,20 @@ class Config:
     INPUT_SIZE = (512, 512)
     BATCH_SIZE = 24
     NUM_EPOCHS = 80
-    LEARNING_RATE = 6e-5
-    WEIGHT_DECAY = 5e-4
+    LEARNING_RATE = 4e-5
+    WEIGHT_DECAY = 2e-3
     
     # EDL parameters
     EDL_UNCERTAINTY_THRESHOLD = 0.3
     KL_WEIGHT = 0.02
     ANNEALING_START = 40
-    LABEL_SMOOTHING = 0.05
+    LABEL_SMOOTHING = 0.1
 
     # Mixup augmentation
-    MIXUP_ALPHA = 0.35
+    MIXUP_ALPHA = 0.4
     
     # Backbone freeze: train EDL head only for first N epochs, then unfreeze at LR/10
-    BACKBONE_FREEZE_EPOCHS = 8
+    BACKBONE_FREEZE_EPOCHS = 12
     
     # Data split
     TRAIN_RATIO = 0.7
@@ -287,36 +287,26 @@ def get_data_transforms(augment=True):
     )
     
     if augment:
-        # ✓ CORRECT augmentation for fundus images
+        # Training-time augmentation
         train_transform = transforms.Compose([
-            # ✓ Small rotations (±10°) - fundus images can be rotated slightly
-            transforms.RandomRotation(10, fill=0),
-            
-            # ✓ Small translations - optical disk might be slightly off-center
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(15, fill=0),
             transforms.RandomAffine(
                 degrees=0,
-                translate=(0.05, 0.05),
+                translate=(0.08, 0.08),
                 fill=0
             ),
-            
-            # ✓ Color jittering - accounts for different imaging equipment
             transforms.ColorJitter(
-                brightness=0.3,
-                contrast=0.3,
-                saturation=0.2,
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.3,
                 hue=0.1
             ),
-            
-            # ✓ Subtle blur - accounts for slight focus variations
             transforms.GaussianBlur(
                 kernel_size=3,
-                sigma=(0.1, 1.0)
+                sigma=(0.1, 2.0)
             ),
-            
-            # ❌ DO NOT USE - corrupts fundus anatomy:
-            # transforms.RandomHorizontalFlip(p=0.5),
-            # transforms.RandomVerticalFlip(p=0.5),
-            
+            transforms.RandomGrayscale(p=0.1),
             transforms.ToTensor(),
             normalize
         ])
@@ -677,12 +667,11 @@ class Trainer:
             lr=config.LEARNING_RATE,
             weight_decay=config.WEIGHT_DECAY
         )
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            mode='max',  # Track val macro F1 (higher is better)
-            factor=0.7,  # Less aggressive than 0.5; prevents LR collapsing before early stopping fires
-            patience=5,
-            min_lr=1e-6
+            T_0=20,
+            T_mult=1,
+            eta_min=1e-6
         )
         
         # Mixed precision training
@@ -725,7 +714,7 @@ class Trainer:
         total_kl = 0
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config.NUM_EPOCHS}')
-        for images, targets in pbar:
+        for batch_idx, (images, targets) in enumerate(pbar):
             images = images.to(self.device)
             targets = targets.to(self.device)
             images, targets_a, targets_b, lam = self.apply_mixup(images, targets)
@@ -759,6 +748,9 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
+
+            # Per-batch scheduler update for CosineAnnealingWarmRestarts
+            self.scheduler.step(epoch + (batch_idx + 1) / len(self.train_loader))
             
             # Get predictions
             with torch.no_grad():
@@ -875,9 +867,6 @@ class Trainer:
             self.history['val_vacuity'].append(val_metrics['mean_vacuity'])
             self.history['val_aleatoric'].append(val_metrics['mean_aleatoric'])
             self.history['val_epistemic'].append(val_metrics['mean_epistemic'])
-            
-            # Update scheduler based on val macro F1 (more meaningful than loss on imbalanced data)
-            self.scheduler.step(val_metrics['macro_f1'])
             
             # Logging
             print(f"\nEpoch {epoch+1}/{self.config.NUM_EPOCHS}")
